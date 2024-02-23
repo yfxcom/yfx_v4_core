@@ -7,7 +7,6 @@ import "../libraries/ReentrancyGuard.sol";
 import "../libraries/SafeCast.sol";
 import "../libraries/SignedSafeMath.sol";
 import "../libraries/TransferHelper.sol";
-//import "../interfaces/IERC20.sol";
 import "./MarketStorage.sol";
 import "../interfaces/IMarketLogic.sol";
 import "../interfaces/IManager.sol";
@@ -28,7 +27,7 @@ contract Market is MarketStorage, ReentrancyGuard {
 
     constructor(address _manager, address _marketLogic, address _fundingLogic){
         //require(_manager != address(0) && _marketLogic != address(0) && _fundingLogic != address(0), "Market: address is zero address");
-        require(_manager != address(0) && _marketLogic != address(0), "C0");
+        require(_manager != address(0) && _marketLogic != address(0), "MC0");
         manager = _manager;
         marketLogic = _marketLogic;
         fundingLogic = _fundingLogic;
@@ -40,27 +39,27 @@ contract Market is MarketStorage, ReentrancyGuard {
     }
 
     modifier onlyController() {
-        require(IManager(manager).checkController(msg.sender), "O1");
+        require(IManager(manager).checkController(msg.sender), "MO1");
         _;
     }
 
     modifier onlyRouter() {
-        require(IManager(manager).checkRouter(msg.sender), "O2");
+        require(IManager(manager).checkRouter(msg.sender) || (msg.sender == address(this)), "MO2");
         _;
     }
 
     modifier whenNotCreateOrderPaused() {
-        require(!marketConfig.createOrderPaused, "W0");
+        require(!marketConfig.createOrderPaused, "MW0");
         _;
     }
 
     modifier whenNotSetTPSLPricePaused() {
-        require(!marketConfig.setTPSLPricePaused, "W1");
+        require(!marketConfig.setTPSLPricePaused, "MW1");
         _;
     }
 
     modifier whenUpdateMarginPaused() {
-        require(!marketConfig.updateMarginPaused, "W2");
+        require(!marketConfig.updateMarginPaused, "MW2");
         _;
     }
 
@@ -70,7 +69,7 @@ contract Market is MarketStorage, ReentrancyGuard {
     /// @param _pool pool address
     /// @param _marketType market type: {0: linear, 1: inverse, 2: quanto}
     function initialize(string memory _token, address _marginAsset, address _pool, uint8 _marketType) external {
-        require(msg.sender == manager && _marginAsset != address(0) && _pool != address(0), "Market: Must be manager or valid address");
+        require(msg.sender == manager && _marginAsset != address(0) && _pool != address(0), "MIO");
         token = _token;
         marginAsset = _marginAsset;
         pool = _pool;
@@ -85,9 +84,9 @@ contract Market is MarketStorage, ReentrancyGuard {
         address _marketLogic,
         address _fundingLogic
     ) external onlyController {
-        require(_marketLogic != address(0), "Market: invalid address");
+        require(_marketLogic != address(0), "MM0");
         if (fundingLogic != address(0)) {
-            require(_fundingLogic != address(0), "Market: invalid address");
+            require(_fundingLogic != address(0), "MM1");
         }
         marketLogic = _marketLogic;
         fundingLogic = _fundingLogic;
@@ -109,16 +108,9 @@ contract Market is MarketStorage, ReentrancyGuard {
         emit SwitchPositionMode(_taker, _mode);
     }
 
-    /// @notice create a new order
-    /// @param params order parameters
-    /// @return id order id
-    function createOrder(MarketDataStructure.CreateInternalParams memory params) external nonReentrant onlyRouter whenNotCreateOrderPaused returns (uint256 id) {
-        return _createOrder(params);
-    }
-
-    function _createOrder(MarketDataStructure.CreateInternalParams memory params) internal returns (uint256) {
+    function createOrder(MarketDataStructure.CreateInternalParams memory params) public nonReentrant onlyRouter whenNotCreateOrderPaused returns (uint256) {
         MarketDataStructure.Order memory order = IMarketLogic(marketLogic).createOrderInternal(params);
-        order.id = order.orderType == MarketDataStructure.OrderType.Open || order.orderType == MarketDataStructure.OrderType.Close ? ++orderID : ++triggerOrderID;
+        order.id = ++orderID;
 
         orders[order.id] = order;
         takerOrderList[params._taker].push(order.id);
@@ -132,7 +124,6 @@ contract Market is MarketStorage, ReentrancyGuard {
     }
 
     struct ExecuteOrderInternalParams {
-        uint256 price;
         bytes32 code;
         address inviter;
         uint256 discountRate;
@@ -141,16 +132,15 @@ contract Market is MarketStorage, ReentrancyGuard {
         MarketDataStructure.Position position;
         MarketDataStructure.Position oldPosition;
         MarketDataStructure.TradeResponse response;
-        uint256 errorCode;
         address inviteManager;
         int256 settleDustMargin;            // dust margin part to be settled
     }
 
     /// @notice execute an order
     /// @param _id order id
-    /// @return resultCode execute result 0：open success；1:order open fail；2:trigger order open fail
+    /// @return resultCode execute result 0：open success；1:order open fail；2:trigger order open fail; 3:low-level call failed
     /// @return _positionId position id
-    function executeOrder(uint256 _id) external nonReentrant onlyRouter returns (int256 resultCode, uint256 _positionId) {
+    function executeOrder(uint256 _id) external nonReentrant onlyRouter returns (uint256 resultCode, uint256 _positionId, bool isAllClosed) {
         ExecuteOrderInternalParams memory params;
         params.order = orders[_id];
         //freezeMargin > 0 ,order type is open and position direction is same as order direction;freezeMargin = 0,order type is close and position direction is neg of order direction
@@ -178,86 +168,64 @@ contract Market is MarketStorage, ReentrancyGuard {
 
         params.oldPosition = takerPositions[_positionId];
 
-        params.inviteManager = IManager(manager).inviteManager();
-        (params.code, params.inviter, params.discountRate, params.inviteRate) = IInviteManager(params.inviteManager).getReferrerCodeByTaker(orders[_id].taker);
+        params.inviteManager = _inviteManager();
+        (params.code, params.inviter, params.discountRate, params.inviteRate) = _getReferrerCodeByTaker(params.inviteManager, params.order.taker);
 
-        if (params.order.orderType == MarketDataStructure.OrderType.Open || params.order.orderType == MarketDataStructure.OrderType.Close) {
-            lastExecutedOrderId = _id;
-        }
-        (params.order, params.position, params.response, params.errorCode) = IMarketLogic(marketLogic).trade(_id, _positionId, params.discountRate, params.inviteRate);
-        if (params.errorCode != 0) {
-            emit ExecuteOrderError(_id, params.errorCode);
-            if (params.errorCode == 5) {
-                return (2, _positionId);
+        uint256 indexPrice = IMarketLogic(marketLogic).getIndexOrMarketPrice(address(this), params.order.direction == 1, params.order.useIP);
+        // trigger condition validation
+        if (params.order.triggerPrice > 0) {
+            if ((block.timestamp >= params.order.createTs.add(IManager(manager).triggerOrderDuration())) ||
+                (params.order.triggerDirection == 1 ? indexPrice < params.order.triggerPrice : indexPrice > params.order.triggerPrice)) {
+                // 2 is the error code for "trigger order open fail"
+                return (2, _positionId, false);
             }
-            orders[_id].status = MarketDataStructure.OrderStatus.OpenFail;
-            return (1, _positionId);
         }
 
-        params.order.code = params.code;
-//        if (params.order.freezeMargin > 0) TransferHelper.safeTransfer(marginAsset,IManager(manager).vault(), params.order.freezeMargin);
-        if (params.order.freezeMargin > 0) _transfer(IManager(manager).vault(), params.order.freezeMargin);
+        try IMarketLogic(marketLogic).trade(_id, _positionId, params.discountRate, params.inviteRate)
+        returns (
+            MarketDataStructure.Order memory _order,
+            MarketDataStructure.Position memory _position,
+            MarketDataStructure.TradeResponse memory _response
+        ){
+            params.order = _order;
+            params.position = _position;
+            params.response = _response;
+        } catch Error(string memory reason) {
+            emit ExecuteOrderError(_id, reason);
+            orders[_id].status = MarketDataStructure.OrderStatus.OpenFail;
+            // 1 is the error code for "order open fail"
+            return (1, _positionId, false);
+        } catch (bytes memory lowLevelData) {
+            emit ExecuteOrderLowLeveError(_id, lowLevelData);
+            // 3 is the error code for "low-level call failed"
+            return (3, _positionId, false);
+        }
 
+        if (params.order.freezeMargin > 0) _transfer(IManager(manager).vault(), params.order.freezeMargin);
         takerOrderNum[params.order.taker][params.order.orderType]--;
         _setTakerOrderTotalValue(params.order.taker, params.order.orderType, params.order.direction, params.order.freezeMargin.mul(params.order.takerLeverage).toInt256().neg256());
 
-
-        if (params.position.amount < marketConfig.DUST && params.position.amount > 0) {
-            params.settleDustMargin = params.position.takerMargin.toInt256().sub(params.position.fundingPayment).sub(params.response.leftInterestPayment.toInt256());
-            if (params.settleDustMargin > 0) {
-                params.response.toTaker = params.response.toTaker.add(params.settleDustMargin.toUint256());
-            } else {
-                params.order.rlzPnl = params.order.rlzPnl.add(params.settleDustMargin);
-            }
-
-            emit DustPositionClosed(
-                params.order.taker,
-                params.order.market,
-                params.position.id,
-                params.position.amount,
-                params.position.takerMargin,
-                params.position.makerMargin,
-                params.position.value,
-                params.position.fundingPayment,
-                params.response.leftInterestPayment
-            );
-
-            params.order.interestPayment = params.order.interestPayment.add(params.response.leftInterestPayment);
-            params.order.fundingPayment = params.order.fundingPayment.add(params.position.fundingPayment);
-
-            params.position.fundingPayment = 0;
-            params.position.takerMargin = 0;
-            params.position.makerMargin = 0;
-            params.position.debtShare = 0;
-            params.position.amount = 0;
-            params.position.value = 0;
-
-            params.response.isIncreasePosition = false;
-        }
-
-
         if (params.response.isIncreasePosition) {
-            IPool(pool).openUpdate(IPool.OpenUpdateInternalParams(
-                params.order.id,
-                params.response.isDecreasePosition ? params.position.makerMargin : params.position.makerMargin.sub(params.oldPosition.makerMargin),
-                params.response.isDecreasePosition ? params.position.takerMargin : params.position.takerMargin.sub(params.oldPosition.takerMargin),
-                params.response.isDecreasePosition ? params.position.amount : params.position.amount.sub(params.oldPosition.amount),
-                params.response.isDecreasePosition ? params.position.value : params.position.value.sub(params.oldPosition.value),
-                params.response.isDecreasePosition ? 0 : params.order.feeToMaker,
-                params.order.direction,
-                params.order.freezeMargin,
-                params.order.taker,
-                params.response.isDecreasePosition ? 0 : params.order.feeToInviter,
-                params.inviter,
-                params.response.isDecreasePosition ? params.position.debtShare : params.position.debtShare.sub(params.oldPosition.debtShare),
-                params.response.isDecreasePosition ? 0 : params.order.feeToExchange
-            )
-            );
+            IPool.UpdateParams memory u;
+            u.orderId = params.order.id;
+            u.makerMargin = params.response.isDecreasePosition ? params.position.makerMargin : params.position.makerMargin.sub(params.oldPosition.makerMargin);
+            u.takerMargin = params.response.isDecreasePosition ? params.position.takerMargin : params.position.takerMargin.sub(params.oldPosition.takerMargin);
+            u.amount = params.response.isDecreasePosition ? params.position.amount : params.position.amount.sub(params.oldPosition.amount);
+            u.total = params.response.isDecreasePosition ? params.position.value : params.position.value.sub(params.oldPosition.value);
+            u.makerFee = params.response.isDecreasePosition ? 0 : params.order.feeToMaker;
+            u.takerDirection = params.order.direction;
+            u.marginToVault = params.order.freezeMargin;
+            u.taker = params.order.taker;
+            u.feeToInviter = params.response.isDecreasePosition ? 0 : params.order.feeToInviter;
+            u.inviter = params.inviter;
+            u.deltaDebtShare = params.response.isDecreasePosition ? params.position.debtShare : params.position.debtShare.sub(params.oldPosition.debtShare);
+            u.feeToExchange = params.response.isDecreasePosition ? 0 : params.order.feeToExchange;
+            IPool(pool).openUpdate(u);
         }
-
+        
         if (params.response.isDecreasePosition) {
             IPool(pool).closeUpdate(
-                IPool.CloseUpdateInternalParams(
+                IPool.UpdateParams(
                     params.order.id,
                     params.response.isIncreasePosition ? params.oldPosition.makerMargin : params.oldPosition.makerMargin.sub(params.position.makerMargin),
                     params.response.isIncreasePosition ? params.oldPosition.takerMargin : params.oldPosition.takerMargin.sub(params.position.takerMargin),
@@ -276,12 +244,13 @@ contract Market is MarketStorage, ReentrancyGuard {
                     params.order.taker,
                     params.order.feeToInviter,
                     params.inviter,
-                    params.order.feeToExchange
+                    params.order.feeToExchange,
+                    false
                 )
             );
         }
 
-        IInviteManager(params.inviteManager).updateTradeValue(marketType, params.order.taker, params.inviter, params.response.tradeValue);
+        _updateUTP(params.inviteManager, params.order.taker, params.inviter, params.response.tradeValue);
 
         emit ExecuteInfo(params.order.id, params.order.orderType, params.order.direction, params.order.taker, params.response.tradeValue, params.order.feeToDiscount, params.order.tradePrice);
 
@@ -293,10 +262,16 @@ contract Market is MarketStorage, ReentrancyGuard {
             require(params.position.direction != params.oldPosition.direction, "EO2");
         }
 
+        if (params.order.freezeMargin == 0) params.order.freezeMargin = params.oldPosition.takerMargin.sub(params.position.takerMargin);
+        params.order.code = params.code;
+        params.order.tradeIndexPrice = indexPrice;
         orders[_id] = params.order;
         takerPositions[_positionId] = params.position;
 
-        return (0, _positionId);
+        // position mint
+        isAllClosed = params.response.isDecreasePosition == params.response.isIncreasePosition;
+
+        return (0, _positionId, isAllClosed);
     }
 
     struct LiquidateInternalParams {
@@ -313,13 +288,13 @@ contract Market is MarketStorage, ReentrancyGuard {
     ///@param _id position id
     ///@param action liquidate type
     ///@return liquidate order id
-    function liquidate(uint256 _id, MarketDataStructure.OrderType action) public nonReentrant onlyRouter returns (uint256) {
+    function liquidate(uint256 _id, MarketDataStructure.OrderType action, uint256 clearPrice) public onlyRouter returns (uint256) {
         LiquidateInternalParams memory params;
         MarketDataStructure.Position storage position = takerPositions[_id];
         require(position.amount > 0, "L0");
 
         //create liquidate order
-        MarketDataStructure.Order storage order = orders[_createOrder(MarketDataStructure.CreateInternalParams(position.taker, position.id, 0, 0, 0, position.amount, position.takerLeverage, position.direction.neg256().toInt8(), 0, 0, 1, true, position.isETH))];
+        MarketDataStructure.Order storage order = orders[createOrder(MarketDataStructure.CreateInternalParams(position.taker, position.id, 0, 0, 0, position.amount, position.takerLeverage, position.direction.neg256().toInt8(), 0, 0, position.useIP, 1, true, position.isETH))];
         order.frLastX96 = position.frLastX96;
         order.fundingAmount = position.amount.toInt256().mul(position.direction);
         //update interest rate
@@ -329,10 +304,10 @@ contract Market is MarketStorage, ReentrancyGuard {
         order.frX96 = fundingGrowthGlobalX96;
         order.fundingPayment = position.fundingPayment;
 
-        params.inviteManager = IManager(manager).inviteManager();
-        (params.code, params.inviter, params.discountRate, params.inviteRate) = IInviteManager(params.inviteManager).getReferrerCodeByTaker(order.taker);
+        params.inviteManager = _inviteManager();
+        (params.code, params.inviter, params.discountRate, params.inviteRate) = _getReferrerCodeByTaker(params.inviteManager, order.taker);
         //get liquidate info by marketLogic
-        params.response = IMarketLogic(marketLogic).getLiquidateInfo(IMarketLogic.LiquidityInfoParams(position, action, params.discountRate, params.inviteRate));
+        params.response = IMarketLogic(marketLogic).getLiquidateInfo(IMarketLogic.LiquidityInfoParams(position, action, params.discountRate, params.inviteRate, clearPrice));
 
         //update order info
         order.code = params.code;
@@ -348,11 +323,12 @@ contract Market is MarketStorage, ReentrancyGuard {
         order.status = MarketDataStructure.OrderStatus.Opened;
         order.tradeTs = block.timestamp;
         order.tradePrice = params.response.price;
-        order.tradeIndexPrice= params.response.indexPrice;
+        order.tradeIndexPrice = params.response.indexPrice;
+        order.freezeMargin = position.takerMargin;
 
         //liquidate position，update close position info in pool
         IPool(pool).closeUpdate(
-            IPool.CloseUpdateInternalParams(
+            IPool.UpdateParams(
                 order.id,
                 position.makerMargin,
                 position.takerMargin,
@@ -371,15 +347,16 @@ contract Market is MarketStorage, ReentrancyGuard {
                 position.taker,
                 order.feeToInviter,
                 params.inviter,
-                order.feeToExchange
+                order.feeToExchange,
+                action == MarketDataStructure.OrderType.ClearAll
             )
         );
 
         //emit invite info
         if (order.orderType != MarketDataStructure.OrderType.Liquidate) {
-            IInviteManager(params.inviteManager).updateTradeValue(marketType, order.taker, params.inviter, params.response.tradeValue);
+            _updateUTP(params.inviteManager, order.taker, params.inviter, params.response.tradeValue);
         }
-        
+
         emit ExecuteInfo(order.id, order.orderType, order.direction, order.taker, params.response.tradeValue, order.feeToDiscount, order.tradePrice);
 
         //update position info
@@ -391,13 +368,22 @@ contract Market is MarketStorage, ReentrancyGuard {
         position.pnl = position.pnl.add(order.rlzPnl);
         position.fundingPayment = 0;
         position.lastUpdateTs = 0;
-        position.stopLossPrice = 0;
-        position.takeProfitPrice = 0;
-        position.lastTPSLTs = 0;
         //clear position debt share
         position.debtShare = 0;
 
         return order.id;
+    }
+    
+    function _getReferrerCodeByTaker(address inviteManager, address taker)internal view returns(bytes32, address, uint256, uint256){
+        return IInviteManager(inviteManager).getReferrerCodeByTaker(taker);
+    }
+
+    function _updateUTP(address inviteManager, address taker, address inviter, uint256 tradeValue) internal {
+        IInviteManager(inviteManager).updateTradeValue(marketType, taker, inviter, tradeValue);
+    }
+    
+    function _inviteManager() internal view returns(address){
+        return IManager(manager).inviteManager();
     }
 
     ///@notice update market funding rate
@@ -415,9 +401,6 @@ contract Market is MarketStorage, ReentrancyGuard {
         }
         _updateFundingGrowthGlobal();
         _fundingPayment = IFundingLogic(fundingLogic).getFundingPayment(address(this), position.id, fundingGrowthGlobalX96);
-        if (block.timestamp != lastFrX96Ts) {
-            lastFrX96Ts = block.timestamp;
-        }
         position.frLastX96 = fundingGrowthGlobalX96;
         if (_fundingPayment != 0) {
             position.fundingPayment = position.fundingPayment.add(_fundingPayment);
@@ -429,7 +412,12 @@ contract Market is MarketStorage, ReentrancyGuard {
     function _updateFundingGrowthGlobal() internal {
         //calc current funding rate by fundingLogic
         if (fundingLogic != address(0)) {
-            fundingGrowthGlobalX96 = IFundingLogic(fundingLogic).getFunding(address(this));
+            int256 deltaFundingRate;
+            (fundingGrowthGlobalX96, deltaFundingRate) = IFundingLogic(fundingLogic).getFunding(address(this));
+            if (block.timestamp != lastFrX96Ts) {
+                lastFrX96Ts = block.timestamp;
+            }
+            emit UpdateFundingRate(deltaFundingRate);
         }
     }
 
@@ -437,12 +425,11 @@ contract Market is MarketStorage, ReentrancyGuard {
     ///@param _id order id
     function cancel(uint256 _id) external nonReentrant onlyRouter {
         MarketDataStructure. Order storage order = orders[_id];
-        require(order.status == MarketDataStructure.OrderStatus.Open || order.status == MarketDataStructure.OrderStatus.OpenFail, "Market:not open");
+        require(order.status == MarketDataStructure.OrderStatus.Open || order.status == MarketDataStructure.OrderStatus.OpenFail, "MC0");
         order.status = MarketDataStructure.OrderStatus.Canceled;
         //reduce taker order count
         takerOrderNum[order.taker][order.orderType]--;
         _setTakerOrderTotalValue(order.taker, order.orderType, order.direction, order.freezeMargin.mul(order.takerLeverage).toInt256().neg256());
-//        if (order.freezeMargin > 0)TransferHelper.safeTransfer(marginAsset,msg.sender, order.freezeMargin);
         if (order.freezeMargin > 0) _transfer(msg.sender, order.freezeMargin);
     }
 
@@ -458,10 +445,12 @@ contract Market is MarketStorage, ReentrancyGuard {
     ///@param _id position id
     ///@param _profitPrice take profit price
     ///@param _stopLossPrice stop loss price
-    function setTPSLPrice(uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice) external onlyRouter whenNotSetTPSLPricePaused {
-        takerPositions[_id].takeProfitPrice = _profitPrice;
-        takerPositions[_id].stopLossPrice = _stopLossPrice;
-        takerPositions[_id].lastTPSLTs = block.timestamp;
+    function setTPSLPrice(uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool isExecutedByIndexPrice) external onlyRouter whenNotSetTPSLPricePaused {
+        MarketDataStructure.Position storage position = takerPositions[_id];
+        position.takeProfitPrice = _profitPrice;
+        position.stopLossPrice = _stopLossPrice;
+        position.useIP = isExecutedByIndexPrice;
+        position.lastTPSLTs = block.timestamp;
     }
 
     ///@notice increase or decrease taker margin, only router can call
@@ -469,13 +458,12 @@ contract Market is MarketStorage, ReentrancyGuard {
     ///@param _updateMargin increase or decrease margin
     function updateMargin(uint256 _id, uint256 _updateMargin, bool isIncrease) external nonReentrant onlyRouter whenUpdateMarginPaused {
         MarketDataStructure.Position storage position = takerPositions[_id];
-        int256 _deltaMargin;
+        int256 _deltaMargin = _updateMargin.toInt256();
         if (isIncrease) {
             position.takerMargin = position.takerMargin.add(_updateMargin);
-            _deltaMargin = _updateMargin.toInt256();
         } else {
             position.takerMargin = position.takerMargin.sub(_updateMargin);
-            _deltaMargin = _updateMargin.toInt256().neg256();
+            _deltaMargin = _deltaMargin.neg256();
         }
 
         //update taker margin in pool
@@ -501,11 +489,8 @@ contract Market is MarketStorage, ReentrancyGuard {
 
     function getPositionKey(address _taker, int8 _direction) internal view returns (MarketDataStructure.PositionKey key) {
         //if position mode is oneway,position key is 2,else if direction is 1,position key is 1,else position key is 0
-        if (positionModes[_taker] == MarketDataStructure.PositionMode.OneWay) {
-            key = MarketDataStructure.PositionKey.OneWay;
-        } else {
-            key = _direction == - 1 ? MarketDataStructure.PositionKey.Short : MarketDataStructure.PositionKey.Long;
-        }
+        key = positionModes[_taker] == MarketDataStructure.PositionMode.OneWay ? MarketDataStructure.PositionKey.OneWay :
+            _direction == - 1 ? MarketDataStructure.PositionKey.Short : MarketDataStructure.PositionKey.Long;
     }
 
     function getPosition(uint256 _id) external view returns (MarketDataStructure.Position memory) {

@@ -3,6 +3,7 @@ pragma solidity 0.7.6;
 pragma abicoder v2;
 
 import "@openzeppelin/contracts/utils/EnumerableSet.sol";
+import "../libraries/SafeMath.sol";
 import "../interfaces/IMarket.sol";
 import "../interfaces/IPool.sol";
 import "../interfaces/IMarketLogic.sol";
@@ -10,11 +11,15 @@ import "../interfaces/IMarketLogic.sol";
 contract Manager {
     using EnumerableSet for EnumerableSet.AddressSet;
 
+    uint256 constant RATE_PRECISION = 1e6;          // rate decimal 1e6
+
     address public controller;      //controller, can change all config params
     address public router;          //router address
     address public vault;           //vault address
     address public riskFunding;     //riskFunding address
     address public inviteManager;   //inviteManager address
+    address public marketPriceFeed; //marketPriceFeed address
+    address public marketLogic;     //marketLogic address
 
     uint256 public executeOrderFee = 0.0001 ether;  // execution fee of one order
 
@@ -27,8 +32,8 @@ contract Manager {
     uint256 public triggerOrderDuration;    // validity period of trigger orders
 
     bool public paused = true;              // protocol pause flag
-    bool public isFundingPaused = true;     // funding mechanism pause flag
-    bool public isInterestPaused = false;   // interests mechanism pause flag
+    mapping(address => bool) public isFundingPaused;    // funding mechanism pause flag, market => bool
+    mapping(address => bool) public isInterestPaused;   // interests mechanism pause flag, pool => bool
 
     mapping(address => address) public getMakerByMarket;        // mapping of market to pool, market => pool
     mapping(address => address) public getMarketMarginAsset;    // mapping of market to base asset, market => base asset
@@ -51,13 +56,16 @@ contract Manager {
     event ExecuteOrderFeeModified(uint256 _feeToPriceProvider);
     event ExecuteOrderFeeOwnerModified(address _feeOwner);
     event InviteManagerModified(address _referralManager);
+    event MarketPriceFeedModified(address _marketPriceFeed);
+    event MarketLogicModified(address _marketLogic);
     event CancelElapseModified(uint256 _cancelElapse);
     event CommunityExecuteOrderDelayModified(uint256 _communityExecuteOrderDelay);
     event TriggerOrderDurationModified(uint256 triggerOrderDuration);
-    event InterestStatusModified(bool _interestPaused);
-    event FundingStatusModified(bool _fundingPaused);
+    event InterestStatusModified(address pool, bool _interestPaused);
+    event FundingStatusModified(address market, bool _fundingPaused);
     event TreasurerModified(address _treasurer, bool _isOpen);
     event LiquidatorModified(address _liquidator, bool _isOpen);
+    event ControllerInitialized(address _controller);
 
     modifier onlyController{
         require(msg.sender == controller, "Manager:only controller");
@@ -67,6 +75,7 @@ contract Manager {
     constructor(address _controller) {
         require(_controller != address(0), "Manager:address zero");
         controller = _controller;
+        emit ControllerModified(controller);
     }
 
     /// @notice  pause the protocol
@@ -153,31 +162,24 @@ contract Manager {
 
     /// @notice activate or deactivate the interests module
     /// @param _interestPaused true:interest paused;false:interest not paused
-    function modifyInterestStatus(bool _interestPaused) external onlyController {
-        require(isInterestPaused != _interestPaused, "Manager:_interestPaused not change");
+    function modifySingleInterestStatus(address pool, bool _interestPaused) external {
+        require((msg.sender == controller) || (EnumerableSet.contains(pools, msg.sender)), "Manager:only controller or pool");
+        //update interest growth global
+        IPool(pool).updateBorrowIG();
+        isInterestPaused[pool] = _interestPaused;
 
-        for (uint256 i = 0; i < EnumerableSet.length(pools); i++) {
-            IPool(EnumerableSet.at(pools, i)).updateBorrowIG();
-        }
-
-        isInterestPaused = _interestPaused;
-
-        emit InterestStatusModified(_interestPaused);
+        emit InterestStatusModified(pool, _interestPaused);
     }
 
     /// @notice activate or deactivate
     /// @param _fundingPaused true:funding paused;false:funding not paused
-    function modifyFundingStatus(bool _fundingPaused) external onlyController {
-        require(isFundingPaused != _fundingPaused, "Manager:_fundingPaused not change");
-
+    function modifySingleFundingStatus(address market, bool _fundingPaused) external {
+        require((msg.sender == controller) || (EnumerableSet.contains(pools, msg.sender)), "Manager:only controller or pool");
         //update funding growth global
-        for (uint256 i = 0; i < EnumerableSet.length(markets); i++) {
-            IMarket(EnumerableSet.at(markets, i)).updateFundingGrowthGlobal();
-        }
+        IMarket(market).updateFundingGrowthGlobal();
+        isFundingPaused[market] = _fundingPaused;
 
-        isFundingPaused = _fundingPaused;
-
-        emit FundingStatusModified(_fundingPaused);
+        emit FundingStatusModified(market, _fundingPaused);
     }
 
     /// @notice modify vault address
@@ -200,6 +202,20 @@ contract Manager {
     function modifyInviteManager(address _inviteManager) external onlyController{
         inviteManager = _inviteManager;
         emit InviteManagerModified(_inviteManager);
+    }
+
+    /// @notice modify market Price Feed address
+    /// @param _marketPriceFeed market Price Feed address
+    function modifyMarketPriceFeed(address _marketPriceFeed) external onlyController{
+        marketPriceFeed = _marketPriceFeed;
+        emit MarketPriceFeedModified(_marketPriceFeed);
+    }
+
+    /// @notice modify market logic address
+    /// @param _marketLogic market logic address
+    function modifyMarketLogic(address _marketLogic) external onlyController{
+        marketLogic = _marketLogic;
+        emit MarketLogicModified(_marketLogic);
     }
 
     /// @notice modify cancel time elapse
@@ -265,6 +281,16 @@ contract Manager {
         return getPoolBaseAsset[_pool] != address(0);
     }
 
+    /// @notice validate whether an address is a legal logic address
+    function checkMarketLogic(address _logic) external view returns (bool) {
+        return marketLogic == _logic;
+    }
+
+    /// @notice validate whether an address is a legal market price feed address
+    function checkMarketPriceFeed(address _feed) external view returns (bool) {
+        return marketPriceFeed == _feed;
+    }
+
     /// @notice create pair ,only controller can call
     /// @param pool pool address
     /// @param market market address
@@ -289,64 +315,72 @@ contract Manager {
         }
         require(getPoolBaseAsset[pool] == asset, 'Manager:pool base asset error');
         getMarketMarginAsset[market] = asset;
+
+        isFundingPaused[market] = true;
         
         EnumerableSet.add(markets, market);
         if (!EnumerableSet.contains(pools, pool)) {
             EnumerableSet.add(pools, pool);
+            isInterestPaused[pool] = true;
         }
         IMarket(market).initialize(token, asset, pool, marketType);
         IPool(pool).registerMarket(market);
-        
-        _setMarketConfigInternal(market, _config);
 
+        setMarketConfig(market, _config);
+        //let cfg =[[0,0],[4000000,50000],[8000000,100000],[10000000,150000],[12000000,200000],[20000000,600000],[100000000,10000000]]
+        
         emit MarketCreated(market, pool, token, asset, marketType);
     }
 
     /// @notice set general market configurations, only controller can call
     /// @param _config configuration parameters
     function setMarketConfig(address market, MarketDataStructure.MarketConfig memory _config) public onlyController {
-        _setMarketConfigInternal(market, _config);
-    }
+        uint8 marketType = IMarket(market).marketType();
+        require(_config.makerFeeRate < RATE_PRECISION, "MSM0");
+        require(_config.tradeFeeRate < RATE_PRECISION, "MSM1");
+        require(marketType == 2 ? _config.multiplier > 0 : true, "MSM2");
+        require(_config.takerLeverageMin > 0 && _config.takerLeverageMin < _config.takerLeverageMax, "MSM3");
+        require(_config.mm > 0 && _config.mm < SafeMath.div(RATE_PRECISION, _config.takerLeverageMax), "MSM4");
+        require(_config.takerMarginMin > 0 && _config.takerMarginMin < _config.takerMarginMax, "MSM5");
+        require(_config.takerValueMin > 0 && _config.takerValueMin < _config.takerValueMax, "MSM6");
 
-    function _setMarketConfigInternal(address market, MarketDataStructure.MarketConfig memory _config) internal {
-        IMarketLogic(IMarket(market).marketLogic()).checkoutConfig(market, _config);
         IMarket(market).setMarketConfig(_config);
     }
-
+    
     /// @notice modify the pause status for creating an order of a market
     /// @param market market address
-    /// @param paused paused or not
-    function modifyMarketCreateOrderPaused(address market, bool paused) public onlyController{
+    /// @param _paused paused or not
+    function modifyMarketCreateOrderPaused(address market, bool _paused) public onlyController{
         MarketDataStructure.MarketConfig memory _config = IMarket(market).getMarketConfig();
-        _config.createOrderPaused = paused;
-        _setMarketConfigInternal(market, _config);
+        _config.createOrderPaused = _paused;
+        setMarketConfig(market, _config);
     }
 
     /// @notice modify the status for setting tpsl for an position
     /// @param market market address
-    /// @param paused paused or not
-    function modifyMarketTPSLPricePaused(address market, bool paused) public onlyController{
+    /// @param _paused paused or not
+    function modifyMarketTPSLPricePaused(address market, bool _paused) public onlyController{
         MarketDataStructure.MarketConfig memory _config = IMarket(market).getMarketConfig();
-        _config.setTPSLPricePaused = paused;
-        _setMarketConfigInternal(market, _config);
+        _config.setTPSLPricePaused = _paused;
+        setMarketConfig(market, _config);
     }
 
     /// @notice modify the pause status for creating a trigger order
     /// @param market market address
-    /// @param paused paused or not
-    function modifyMarketCreateTriggerOrderPaused(address market, bool paused) public onlyController {
+    /// @param _paused paused or not
+    function modifyMarketCreateTriggerOrderPaused(address market, bool _paused) public onlyController {
         MarketDataStructure.MarketConfig memory _config = IMarket(market).getMarketConfig();
-        _config.createTriggerOrderPaused = paused;
-        _setMarketConfigInternal(market, _config);
+        _config.createTriggerOrderPaused = _paused;
+        setMarketConfig(market, _config);
     }
 
     /// @notice modify the pause status for updating the position margin
     /// @param market market address
-    /// @param paused paused or not
-    function modifyMarketUpdateMarginPaused(address market, bool paused) public onlyController {
+    /// @param _paused paused or not
+    function modifyMarketUpdateMarginPaused(address market, bool _paused) public onlyController {
         MarketDataStructure.MarketConfig memory _config = IMarket(market).getMarketConfig();
-        _config.updateMarginPaused = paused;
-        _setMarketConfigInternal(market, _config);
+        _config.updateMarginPaused = _paused;
+        setMarketConfig(market, _config);
     }
     
     /// @notice get all markets

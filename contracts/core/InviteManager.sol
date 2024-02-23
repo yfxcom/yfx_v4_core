@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.7.6;
 
 import "../libraries/SafeMath.sol";
@@ -179,20 +179,6 @@ contract InviteManager {
     /// @param _newAccount new account address
     function setCodeOwnerBySystem(bytes32 _code, address _newAccount) external onlyController {
         require(_code != bytes32(0), "InviteManager: invalid _code");
-        codeOwners[_code].owner = _newAccount;
-        emit SetCodeOwner(msg.sender, _newAccount, _code);
-    }
-
-
-    /// @notice set code owner, only owner can call
-    /// @param _code referral code
-    /// @param _newAccount new account address
-    function setCodeOwner(bytes32 _code, address _newAccount) external {
-        require(_code != bytes32(0), "InviteManager: invalid _code");
-
-        address account = codeOwners[_code].owner;
-        require(msg.sender == account, "InviteManager: forbidden");
-
         codeOwners[_code].owner = _newAccount;
         emit SetCodeOwner(msg.sender, _newAccount, _code);
     }

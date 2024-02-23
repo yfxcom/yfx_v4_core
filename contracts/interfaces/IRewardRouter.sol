@@ -4,5 +4,7 @@ pragma solidity >=0.6.0 <0.8.0;
 interface IRewardRouter {
     function stakeLpForAccount(address _account, address _lp, uint256 _amount) external returns (uint256);
 
-    function unstakeLpForAccount(address _account, address _lp, uint256 _amount) external returns (uint256);
+    function unstakeLpForAccount(address _account, address _lp, uint256 _amount, bool isLiquidate) external returns (uint256);
+
+    function modifyStakedPosition(address market, address taker, bool isCloseAll) external;
 }

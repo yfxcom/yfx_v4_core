@@ -2,7 +2,6 @@
 pragma solidity >=0.6.0 <0.8.0;
 pragma abicoder v2;
 
-import "../libraries/PoolDataStructure.sol";
 import "../core/PoolStorage.sol";
 
 interface IPool {
@@ -11,40 +10,17 @@ interface IPool {
         uint256 lastInterestUpdateTs;
         uint256 borrowIG;
     }
-
-    /// @notice the following tow structs are parameters used to update pool data when an order is executed.
-    ///         We differ the affect of the executed order by result as open or close,
-    ///         which represents increase or decrease the position.
-    ///         Normally, there's one type of pool update operation during one order execution,
-    ///         excepts in the one-way position model, when an order causing the position reversal, both opening and
-    ///         closing process will be executed respectively.
-
-    struct OpenUpdateInternalParams {
+    
+    struct UpdateParams {
         uint256 orderId;
-        uint256 _makerMargin;   // pool balance taken by this order
-        uint256 _takerMargin;   // taker margin for this order
-        uint256 _amount;        // order amount
-        uint256 _total;         // order value
-        uint256 makerFee;       // fees distributed to the pool, specially when an order causes the position reversal, the fee to maker will be updated in the closing process
-        int8 _takerDirection;   // order direction
-        uint256 marginToVault;  // margin should transferred to the vault
-        address taker;          // taker address
-        uint256 feeToInviter;   // fees distributed to the inviter, specially when an order causes the position reversal, the fee to maker will be updated in the closing process
-        address inviter;        // inviter address
-        uint256 deltaDebtShare; //add position debt share
-        uint256 feeToExchange;  // fee distributed to the protocol, specially when an order causes the position reversal, the fee to maker will be updated in the closing process
-    }
-
-    struct CloseUpdateInternalParams {
-        uint256 orderId;
-        uint256 _makerMargin;//reduce maker margin，taker margin，amount，value
-        uint256 _takerMargin;
-        uint256 _amount;
-        uint256 _total;
-        int256 _makerProfit;
+        uint256 makerMargin;//reduce maker margin，taker margin，amount，value
+        uint256 takerMargin;
+        uint256 amount;
+        uint256 total;
+        int256 makerProfit;
         uint256 makerFee;   //trade fee to maker
         int256 fundingPayment;//settled funding payment
-        int8 _takerDirection;//old position direction
+        int8 takerDirection;//old position direction
         uint256 marginToVault;// reduce position size ,order margin should be to record in vault
         uint256 deltaDebtShare;//reduce position debt share
         uint256 payInterest;//settled interest payment
@@ -55,8 +31,19 @@ interface IPool {
         uint256 feeToInviter; //trade fee to inviter
         address inviter;//inviter address
         uint256 feeToExchange;//fee to exchange
+        bool isClearAll;
     }
 
+    struct Position{
+        address maker;
+        uint256 initMargin;
+        uint256 liquidity;
+        uint256 entryValue;
+        uint256 lastAddTime;
+        uint256 makerStopLossPrice;
+        uint256 makerProfitPrice;
+    }
+    
     event Mint(address indexed sender, uint256 amount0, uint256 amount1);
     event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
 
@@ -78,42 +65,25 @@ interface IPool {
 
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 
-    function setMinAddLiquidityAmount(uint256 _minAmount) external returns (bool);
-
-    function setMinRemoveLiquidity(uint256 _minLiquidity) external returns (bool);
-
-    function setOpenRate(address _market, uint256 _openRate, uint256 _openLimit) external returns (bool);
-
-    //function setRemoveLiquidityFeeRatio(uint256 _rate) external returns (bool);
-
     function canOpen(address _market, uint256 _makerMargin) external view returns (bool);
 
     function getMakerOrderIds(address _maker) external view returns (uint256[] memory);
 
-    function getOrder(uint256 _no) external view returns (PoolDataStructure.MakerOrder memory);
+    function makerPositions(uint256 positionId) external view returns (Position memory);
 
-    function openUpdate(OpenUpdateInternalParams memory params) external returns (bool);
+    function openUpdate(UpdateParams memory params) external;
 
-    function closeUpdate(CloseUpdateInternalParams memory params) external returns (bool);
+    function closeUpdate(UpdateParams memory params) external;
 
-    function takerUpdateMargin(address _market, address, int256 _margin, bool isOutETH) external returns (bool);
+    function takerUpdateMargin(address _market, address, int256 _margin, bool isOutETH) external;
 
-    function addLiquidity(address sender, uint256 amount) external returns (uint256 _id);
+    function addLiquidity(uint256 orderId, address sender, uint256 amount, uint256 leverage) external returns(uint256 liquidity);
 
-    function executeAddLiquidityOrder(uint256 id) external returns (uint256 liquidity);
+    function removeLiquidity(uint256 orderId, address sender, uint256 liquidity, bool isETH, bool isSystem) external returns (uint256 settleLiquidity);
 
-    function removeLiquidity(address sender, uint256 liquidity) external returns (uint256 _id, uint256 _liquidity);
-
-    function executeRmLiquidityOrder(uint256 id, bool isETH) external returns (uint256 amount);
-
-    function getLpBalanceOf(address _maker) external view returns (uint256 _balance, uint256 _totalSupply);
+    function liquidate(uint256 positionId) external ;
 
     function registerMarket(address _market) external returns (bool);
-
-    function getSharePrice() external view returns (
-        uint256 _price,
-        uint256 _balance
-    );
 
     function updateFundingPayment(address _market, int256 _fundingPayment) external;
 
@@ -127,15 +97,7 @@ interface IPool {
 
     function updateBorrowIG() external;
 
-    function getAllMarketData() external view returns (PoolStorage.DataByMarket memory allMarketPos, uint256 allMakerFreeze);
-
-    function getAssetAmount() external view returns (uint256 amount);
-
     function getBaseAsset() external view returns (address);
-
-    function getAutoId() external view returns (uint256);
-
-//    function updateLiquidatorFee(address _liquidator) external;
 
     function minRemoveLiquidityAmount() external view returns (uint256);
 
@@ -149,5 +111,25 @@ interface IPool {
 
     function removePaused() external view returns (bool);
 
-    function makerProfitForLiquidity(bool isAdd) external view returns (int256 unPNL);
+    function clearAll() external view returns (bool);
+
+    function makerPositionIds(address maker) external view returns (uint256);
+    
+    function mm()external view returns (uint256);
+    
+    function globalHf()external view returns (bool status, uint256 poolTotalTmp, int256 totalUnPNL);
+
+    function addMakerPositionMargin(uint256 positionId, uint256 addMargin) external;
+
+    function setTPSLPrice(address maker, uint256 positionId, uint256 tp, uint256 sl) external;
+    
+    function balance() external view returns (int256);
+    
+    function balanceReal() external view returns (int256);
+    
+    function getMarketList() external view returns (address[] memory);
+
+    function poolDataByMarkets(address market) external view returns (int256, uint256, uint256, uint256, uint256, int256, uint256, uint256, uint256, uint256, uint256);
+    
+    function interestData(int8 direction) external view returns (IPool.InterestData memory);
 }

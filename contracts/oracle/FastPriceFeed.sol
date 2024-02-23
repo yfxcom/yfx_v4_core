@@ -1,14 +1,20 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.7.6;
 pragma abicoder v2;
 
+import "../libraries/PythStructs.sol";
 import "../libraries/SafeMath.sol";
+import "../libraries/Common.sol";
 import "../interfaces/IManager.sol";
 import "../interfaces/IMarketPriceFeed.sol";
+import "../interfaces/IFeeManager.sol";
+import "../interfaces/IVerifierProxy.sol";
+import "../interfaces/IFastPriceFeed.sol";
+import "../interfaces/IPyth.sol";
 
 contract FastPriceFeed {
     using SafeMath for uint256;
-    using SafeMath for uint128;
+    using SafeMath for uint32;
 
     uint256 public constant MAX_REF_PRICE = type(uint160).max;//max chainLink price
     uint256 public constant MAX_CUMULATIVE_REF_DELTA = type(uint32).max;//max cumulative chainLink price delta
@@ -33,8 +39,11 @@ contract FastPriceFeed {
     mapping(string => uint256) public maxCumulativeDeltaDiffs;//max cumulative delta diff,delta = (cumulativeFastDelta - cumulativeRefDelta)
 
     // should be 10 ** 8
-    uint256[] public tokenPrecisions;//offChain price decimals
     string[] public tokens;//index token
+    mapping(bytes32 => string) public feedIds;
+    mapping(bytes32 => string) public pythFeedIds;
+    mapping(string => uint256) public backUpPricePrecisions;
+    mapping(string => uint256) public primaryPricePrecisions;
 
     bool public isInitialized;//is initialized,only can be initialized once
     address public marketPriceFeed;//marketPriceFeed address
@@ -54,7 +63,33 @@ contract FastPriceFeed {
     uint256 public priceDataInterval = 60;//cumulative delta interval
     bool public isSpreadEnabled = false;//is spread enabled
     address public manager;
-    
+
+    IVerifierProxy public verifier;
+    IPyth public pyth;
+    uint256 public maxPriceTsDiff;//max price timestamp diff
+
+    struct BasicReport {
+        bytes32 feedId; // The feed ID the report has data for
+        uint32 validFromTimestamp; // Earliest timestamp for which price is applicable
+        uint32 observationsTimestamp; // Latest timestamp for which price is applicable
+        uint192 nativeFee; // Base cost to validate a transaction using the report, denominated in the chain’s native token (WETH/ETH)
+        uint192 linkFee; // Base cost to validate a transaction using the report, denominated in LINK
+        uint64 expiresAt; // Latest timestamp where the report can be verified on-chain
+        int192 price; // DON consensus median price, carried to 8 decimal places
+    }
+
+    struct PremiumReport {
+        bytes32 feedId; // The feed ID the report has data for
+        uint32 validFromTimestamp; // Earliest timestamp for which price is applicable
+        uint32 observationsTimestamp; // Latest timestamp for which price is applicable
+        uint192 nativeFee; // Base cost to validate a transaction using the report, denominated in the chain’s native token (WETH/ETH)
+        uint192 linkFee; // Base cost to validate a transaction using the report, denominated in LINK
+        uint64 expiresAt; // Latest timestamp where the report can be verified on-chain
+        int192 price; // DON consensus median price, carried to 8 decimal places
+        int192 bid; // Simulated price impact of a buy order up to the X% depth of liquidity utilisation
+        int192 ask; // Simulated price impact of a sell order up to the X% depth of liquidity utilisation
+    }
+
     event PriceData(string token, uint256 refPrice, uint256 fastPrice, uint256 cumulativeRefDelta, uint256 cumulativeFastDelta);
     event MaxCumulativeDeltaDiffExceeded(string token, uint256 refPrice, uint256 fastPrice, uint256 cumulativeRefDelta, uint256 cumulativeFastDelta);
     event PriceUpdated(string _token, uint256 _price);
@@ -67,10 +102,14 @@ contract FastPriceFeed {
     event SetSpreadBasisPointsIfInactive(uint256 _spreadBasisPointsIfInactive);
     event SetSpreadBasisPointsIfChainError(uint256 _spreadBasisPointsIfChainError);
     event SetPriceDataInterval(uint256 _priceDataInterval);
+    event SetVerifier(IVerifierProxy verifier);
     event SetIsSpreadEnabled(bool _isSpreadEnabled);
-    event SetTokens(string[] _tokens, uint256[] _tokenPrecisions);
+    event SetTokens(string[] _tokens, bytes32[] _feedIds, bytes32[] _pythFeedIds, uint256[] _backUpPricePrecisions, uint256[] _primaryPricePrecisions);
     event SetLastUpdatedAt(string token, uint256 lastUpdatedAt);
     event SetMaxCumulativeDeltaDiff(string token, uint256 maxCumulativeDeltaDiff);
+    event fallbackCalled(address sender, uint256 value, bytes data);
+    event SetPyth(IPyth _pyth);
+    event SetMaxPriceTsDiff(uint256 _maxPriceTsDiff);
 
     modifier onlyRouter() {
         require(IManager(manager).checkRouter(msg.sender), "FastPriceFeed: forbidden");
@@ -79,6 +118,11 @@ contract FastPriceFeed {
 
     modifier onlyController() {
         require(IManager(manager).checkController(msg.sender), "FastPriceFeed: Must be controller");
+        _;
+    }
+
+    modifier onlyTreasurer() {
+        require(IManager(manager).checkTreasurer(msg.sender), "FastPriceFeed: Must be treasurer");
         _;
     }
 
@@ -171,25 +215,123 @@ contract FastPriceFeed {
         emit SetPriceDataInterval(_priceDataInterval);
     }
 
-    function setTokens(string[] memory _tokens, uint256[] memory _tokenPrecisions) external onlyController {
-        require(_tokens.length == _tokenPrecisions.length, "FastPriceFeed: invalid lengths");
-        tokens = _tokens;
-        tokenPrecisions = _tokenPrecisions;
-        emit SetTokens(_tokens, _tokenPrecisions);
+    function setVerifier(IVerifierProxy _verifier) external onlyController {
+        verifier = _verifier;
+        emit SetVerifier(verifier);
     }
 
-    function setPrices(string[] memory _tokens, uint128[] memory _prices, uint32[] memory _timestamps) external onlyRouter {
-        for (uint256 i = 0; i < _tokens.length; i++) {
-            bool shouldUpdate = _setLastUpdatedValues(_tokens[i], _timestamps[i]);
-            if (shouldUpdate) {
-                uint256 price = _prices[i];
-                if (price != 0) {
-                    price = price.mul(PRICE_PRECISION).div(10 ** tokenPrecisions[i]);
-                    _setPrice(_tokens[i], price, marketPriceFeed);
-                }
-            }
+    function setPyth(IPyth _pyth) external onlyController {
+        pyth = _pyth;
+        emit SetPyth(_pyth);
+    }
+
+    function setMaxPriceTsDiff(uint256 _maxPriceTsDiff) external onlyController {
+        maxPriceTsDiff = _maxPriceTsDiff;
+        emit SetMaxPriceTsDiff(_maxPriceTsDiff);
+    }
+
+    function withdrawVerifyingFee(address _to) external onlyTreasurer {
+        uint256 balance = address(this).balance;
+        if (balance > 0) {
+            payable(_to).transfer(balance);
+        }
+    }
+
+    function setTokens(string[] memory _tokens, bytes32[] memory _feedIds, bytes32[] memory _pythFeedIds, uint256[] memory _backUpPricePrecisions, uint256[] memory _primaryPricePrecisions) external onlyController {
+        require(_tokens.length == _pythFeedIds.length, "FastPriceFeed: invalid pyth feed id lengths");
+        require(_tokens.length == _feedIds.length, "FastPriceFeed: invalid feed id lengths");
+        require(_tokens.length == _backUpPricePrecisions.length, "FastPriceFeed: invalid backUpPricePrecisions lengths");
+        require(_tokens.length == _primaryPricePrecisions.length, "FastPriceFeed: invalid primaryPricePrecisions lengths");
+        tokens = _tokens;
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            feedIds[_feedIds[i]] = tokens[i];
+            backUpPricePrecisions[tokens[i]] = _backUpPricePrecisions[i];
+            primaryPricePrecisions[tokens[i]] = _primaryPricePrecisions[i];
+            pythFeedIds[_pythFeedIds[i]] = tokens[i];
         }
 
+        emit SetTokens(_tokens, _feedIds, _pythFeedIds, _backUpPricePrecisions, _primaryPricePrecisions);
+    }
+    
+    function setPrices(bytes memory backupPrices, bytes memory primaryPrices) external payable onlyRouter{
+        uint256 price;
+        bool shouldUpdate;
+        if (backupPrices.length == 0 && primaryPrices.length == 0) {
+            require(false, "FastPriceFeed: invalid prices length");
+        } else if (backupPrices.length != 0 && primaryPrices.length == 0) {
+            bytes[] memory _backupPrices = abi.decode(backupPrices, (bytes[]));
+            for (uint256 i = 0; i < _backupPrices.length; i++) {
+                (string memory token, uint192 backUpPrice, uint32 ts) = abi.decode(_backupPrices[i], (string, uint192, uint32));
+                shouldUpdate = _setLastUpdatedValues(token, ts);
+                if (shouldUpdate) {
+                    price = backUpPrice;
+                    if (price > 0) {
+                        price = price.mul(PRICE_PRECISION).div(10 ** backUpPricePrecisions[token]);
+                        _setPrice(token, price, marketPriceFeed);
+                    }
+                }
+            }
+        } else {
+            // price type 1:pyth price feed ; price type 2: chainlink price feed
+            (uint8 priceType, bytes memory _primaryPrices) = abi.decode(primaryPrices, (uint8, bytes));
+            require(priceType == 1 || priceType == 2, "FastPriceFeed: invalid priceType");
+            if (priceType == 1) {
+                (bytes32[] memory _priceIds, bytes[] memory _priceUpdateData) = abi.decode(_primaryPrices, (bytes32[], bytes[]));
+                uint256 fee = pyth.getUpdateFee(_priceUpdateData);
+                require(msg.value == fee, "FastPriceFeed: invalid fee");
+                PythStructs.PriceFeed[] memory _priceFeed = pyth.parsePriceFeedUpdates{value: fee}(_priceUpdateData, _priceIds, uint64(block.timestamp.sub(maxPriceTsDiff)), uint64(block.timestamp));
+                
+                for (uint256 i = 0; i < _priceIds.length; i++) {
+                    string memory token = pythFeedIds[_priceIds[i]];
+                    require(_priceFeed[i].price.price > 0 && _priceFeed[i].price.expo <= 0, "FastPriceFeed: invalid price");
+
+                    shouldUpdate = _setLastUpdatedValues(token, uint32(_priceFeed[i].price.publishTime));
+                    if (shouldUpdate) {
+                        price = uint256(_priceFeed[i].price.price);
+                        price = price.mul(PRICE_PRECISION).div(10 ** uint32(- _priceFeed[i].price.expo));
+                        _setPrice(token, price, marketPriceFeed);
+                    }
+                }
+            } else {
+                bytes[] memory _signedReports = abi.decode(_primaryPrices, (bytes[]));
+                IFeeManager feeManager = IFeeManager(address(verifier.s_feeManager()));
+                address feeNativeTokenAddress = feeManager.i_nativeAddress();
+                uint256 feeCost;
+                for (uint256 i = 0; i < _signedReports.length; i++) {
+                    (BasicReport memory basicReport, uint256 fee) = _calcVerifyFee(_signedReports[i], feeManager, feeNativeTokenAddress);
+                    feeCost = feeCost.add(fee);
+                    shouldUpdate = _setLastUpdatedValues(feedIds[basicReport.feedId], basicReport.validFromTimestamp);
+                    if (shouldUpdate) {
+                        require(basicReport.price > 0, "FastPriceFeed: invalid price");
+                        price = uint256(basicReport.price);
+                        price = price.mul(PRICE_PRECISION).div(10 ** primaryPricePrecisions[feedIds[basicReport.feedId]]);
+                        _setPrice(feedIds[basicReport.feedId], price, marketPriceFeed);
+                    }
+                }
+
+                // Verify the reports
+                verifier.verifyBulk{value: feeCost}(
+                    _signedReports,
+                    abi.encode(feeNativeTokenAddress)
+                );
+            }
+        }
+    }
+
+    function _calcVerifyFee(bytes memory unverifiedReport, IFeeManager feeManager, address feeNativeTokenAddress) internal returns (BasicReport memory basicReport, uint256 feeCost){
+        (, /* bytes32[3] reportContextData */ bytes memory reportData) = abi.decode(unverifiedReport, (bytes32[3], bytes));
+        basicReport = abi.decode(reportData, (BasicReport));
+        require(block.timestamp <= basicReport.validFromTimestamp.add(maxPriceTsDiff) && block.timestamp <= basicReport.observationsTimestamp, "FastPriceFeed: invalid price ts");
+        require(basicReport.expiresAt >= block.timestamp, "FastPriceFeed: invalid expiresAt");
+
+        // Report verification fees
+        (Common.Asset memory fee, ,) = feeManager.getFeeAndReward(
+            address(this),
+            reportData,
+            feeNativeTokenAddress
+        );
+
+        feeCost = fee.amount;
     }
 
     // under regular operation, the fastPrice (prices[token]) is returned and there is no spread returned from this function,
@@ -210,7 +352,7 @@ contract FastPriceFeed {
             }
             return _refPrice.mul(BASIS_POINTS_DIVISOR.sub(spreadBasisPointsIfChainError)).div(BASIS_POINTS_DIVISOR);
         }
-        
+
         if (block.timestamp > uint256(lastUpdatedAts[_token]).add(priceDuration)) {
             if (_maximise) {
                 return _refPrice.mul(BASIS_POINTS_DIVISOR.add(spreadBasisPointsIfInactive)).div(BASIS_POINTS_DIVISOR);
@@ -257,7 +399,7 @@ contract FastPriceFeed {
         return true;
     }
 
-    function getIndexPrice(string memory _token, uint256 _refPrice, bool _maximise) external view returns (uint256) {
+    function getIndexPrice(string memory _token, uint256 _refPrice, bool /* _maximise*/) external view returns (uint256) {
         if (block.timestamp > uint256(lastUpdatedAts[_token]).add(indexPriceDuration)) {
             return _refPrice;
         }
@@ -297,11 +439,11 @@ contract FastPriceFeed {
                     cumulativeRefDelta = 0;
                     cumulativeFastDelta = 0;
                 }
-               
+
                 cumulativeRefDelta = cumulativeRefDelta.add(refDeltaAmount.mul(CUMULATIVE_DELTA_PRECISION).div(prevRefPrice));
                 cumulativeFastDelta = cumulativeFastDelta.add(fastDeltaAmount.mul(CUMULATIVE_DELTA_PRECISION).div(fastPrice));
             }
-            
+
             if (cumulativeFastDelta > cumulativeRefDelta && cumulativeFastDelta.sub(cumulativeRefDelta) > maxCumulativeDeltaDiffs[_token]) {
                 emit MaxCumulativeDeltaDiffExceeded(_token, refPrice, fastPrice, cumulativeRefDelta, cumulativeFastDelta);
             }
@@ -345,5 +487,9 @@ contract FastPriceFeed {
         lastUpdatedBlock = block.number;
 
         return true;
+    }
+
+    receive() external payable {
+        emit fallbackCalled(msg.sender, msg.value, msg.data);
     }
 }

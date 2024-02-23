@@ -2,7 +2,7 @@
 pragma solidity 0.7.6;
 pragma abicoder v2;
 
-import "../libraries/PoolDataStructure.sol";
+//import "../libraries/PoolDataStructure.sol";
 import "../interfaces/IPool.sol";
 
 contract PoolStorage {
@@ -11,39 +11,44 @@ contract PoolStorage {
     //
 
     // constant
-    uint256  constant RATE_PRECISION = 1e6;                     // example rm lp fee rate 1000/1e6=0.001
-    uint256  constant PRICE_PRECISION = 1e10;
-    uint256  constant AMOUNT_PRECISION = 1e20;
+    uint256 constant RATE_PRECISION = 1e6;                     // example rm lp fee rate 1000/1e6=0.001
+    uint256 constant PRICE_PRECISION = 1e10;
+    uint256 constant AMOUNT_PRECISION = 1e20;
 
     // contracts addresses used
-    address public vault;                                       // vault address
+    address vault;                                              // vault address
     address baseAsset;                                          // base token address
     address marketPriceFeed;                                    // price feed contract address
-    uint256 public baseAssetDecimals;                           // base token decimals
-    address public interestLogic;                               // interest logic address
-    address public WETH;                                        // WETH address 
+    uint256 baseAssetDecimals;                                  // base token decimals
+    address interestLogic;                                      // interest logic address
+    address WETH;                                               // WETH address 
 
     bool public addPaused = false;                              // flag for adding liquidity
     bool public removePaused = false;                           // flag for remove liquidity
     uint256 public minRemoveLiquidityAmount;                    // minimum amount (lp) for removing liquidity
     uint256 public minAddLiquidityAmount;                       // minimum amount (asset) for add liquidity
     uint256 public removeLiquidityFeeRate = 1000;               // fee ratio for removing liquidity
+    uint256 public mm;                                          // maintenance margin ratio
+    bool public clearAll;
+    uint256 public minLeverage;
+    uint256 public maxLeverage;
+    uint256 public penaltyRate;
 
-    uint256 public balance;                                     // balance that is available to use of this pool
+    int256 public balance;                                      // balance that is available to use of this pool
+    int256 public balanceReal;
     uint256 public reserveRate;                                 // reserve ratio
-    uint256 public sharePrice;                                  // net value
+    uint256 sharePrice;                                         // net value
     uint256 public cumulateRmLiqFee;                            // cumulative fee collected when removing liquidity
-    uint256 public autoId = 1;                                  // liquidity operations order id
-    mapping(address => uint256) lastOperationTime;              // mapping of last operation timestamp for addresses
+    uint256 public autoId;                                      // liquidity operations order id
+    uint256 eventId;                                            // event count
 
-    address[] public marketList;                                // supported markets array
+    address[] marketList;                                       // supported markets array
     mapping(address => bool) public isMarket;                   // supported markets mapping
-    mapping(uint256 => PoolDataStructure.MakerOrder) makerOrders;           // liquidity orders
-    mapping(address => uint256[]) public makerOrderIds;         // mapping of liquidity orders for addresses
-    mapping(address => uint256) public freezeBalanceOf;         // frozen liquidity amount when removing
     mapping(address => MarketConfig) public marketConfigs;      // mapping of market configs
     mapping(address => DataByMarket) public poolDataByMarkets;  // mapping of market data
     mapping(int8 => IPool.InterestData) public interestData;    // mapping of interest data for position directions (long or short)
+    mapping(uint256 => IPool.Position) public makerPositions;   // mapping of liquidity positions for addresses
+    mapping(address => uint256) public makerPositionIds;        // mapping of liquidity positions for addresses
 
     //structs
     struct MarketConfig {
@@ -59,23 +64,48 @@ contract PoolStorage {
         uint256 shortMakerFreeze;                               // user total short margin freeze, that is pool long margin freeze
         uint256 takerTotalMargin;                               // all taker's margin
         int256 makerFundingPayment;                             // pending fundingPayment
+        uint256 interestPayment;                                // interestPayment          
         uint256 longAmount;                                     // sum asset for long pos
         uint256 longOpenTotal;                                  // sum value  for long pos
         uint256 shortAmount;                                    // sum asset for short pos
         uint256 shortOpenTotal;                                 // sum value for short pos
     }
 
+    struct PoolParams {
+        uint256 _minAmount;
+        uint256 _minLiquidity;
+        address _market;
+        uint256 _openRate;
+        uint256 _openLimit;
+        uint256 _reserveRate;
+        uint256 _ratio;
+        bool _add;
+        bool _remove;
+        address _interestLogic;
+        address _marketPriceFeed;
+        uint256 _mm;
+        uint256 _minLeverage;
+        uint256 _maxLeverage;
+        uint256 _penaltyRate;
+    }
+
+    struct GlobalHf {
+        uint256 sharePrice;
+        uint256[] indexPrices;
+        uint256 allMakerFreeze;
+        DataByMarket allMarketPos;
+        uint256 poolInterest;
+        int256 totalUnPNL;
+        uint256 poolTotalTmp;
+    }
+
     event RegisterMarket(address market);
-    event SetMinAddLiquidityAmount(uint256 minAmount);
-    event SetMinRemoveLiquidity(uint256 minLp);
-    event SetOpenRateAndLimit(address market, uint256 openRate, uint256 openLimit);
-    event SetReserveRate(uint256 reserveRate);
-    event SetRemoveLiquidityFeeRatio(uint256 feeRate);
-    event SetPaused(bool addPaused, bool removePaused);
-    event SetInterestLogic(address interestLogic);
-    event SetMarketPriceFeed(address marketPriceFeed);
-    event ExecuteAddLiquidityOrder(uint256 orderId, address maker, uint256 amount, uint256 share, uint256 sharePrice);
-    event ExecuteRmLiquidityOrder(uint256 orderId, address maker, uint256 rmAmount, uint256 rmShare, uint256 sharePrice, uint256 rmFee);
+    event AddLiquidity(uint256 id, uint256 orderId, address maker, uint256 positionId, uint256 initMargin, uint256 liquidity, uint256 entryValue, uint256 sharePrice, uint256 totalValue);
+    event RemoveLiquidity(uint256 id, uint256 orderId, address maker, uint256 positionId, uint256 rmMargin, uint256 rmLiquidity, uint256 rmValue, int256 pnl, int256 toMaker, uint256 sharePrice, uint256 rmFee, uint256 totalValue, uint256 actionType);
+    event Liquidate(uint256 id, address maker,uint256 positionId, uint256 rmMargin, uint256 rmLiquidity, uint256 rmValue, int256 pnl, int256 toMaker,uint256 penalty, uint256 sharePrice, uint256 totalValue);
+    event ActivatedClearAll(uint256 ts, uint256[] indexPrices);
+    event AddMakerPositionMargin(uint256 id, uint256 positionId, uint256 addMargin);
+    event ReStarted(address pool);
     event OpenUpdate(
         uint256 indexed id,
         address indexed market,

@@ -48,7 +48,7 @@ contract InterestLogic {
     /// @param totalAmount total amount
     /// @param reserveRate reserve rate
     /// @return utilization ratio scaled 1e27
-    function utilizationRatio(uint256 usedAmount, uint256 totalAmount, uint256 reserveRate) public view returns (uint256) {
+    function utilizationRatio(uint256 usedAmount, uint256 totalAmount, uint256 reserveRate) public pure returns (uint256) {
         if (usedAmount == 0) return 0;
         uint256 availableTotal = totalAmount.mul(RATE_PRECISION.sub(reserveRate)).div(RATE_PRECISION);
         return usedAmount.rayDiv(availableTotal);
@@ -80,7 +80,7 @@ contract InterestLogic {
     * @param deltaTs delta time
     * @return interest scaled 1e27
     */
-    function calculateCompoundedInterest(uint256 interestRate, uint256 deltaTs) internal view returns (uint256) {
+    function calculateCompoundedInterest(uint256 interestRate, uint256 deltaTs) internal pure returns (uint256) {
         uint256 expMinusOne = deltaTs > 1 ? deltaTs - 1 : 0;
         uint256 expMinusTwo = deltaTs > 2 ? deltaTs - 2 : 0;
 
@@ -108,7 +108,7 @@ contract InterestLogic {
         borrowRate = getBorrowRate(_pool, usedAmount, totalAmount, reserveRate);
         if (lastUpdateTs == 0) return (0, WadRayMath.RAY);
         uint256 deltaTs = block.timestamp - lastUpdateTs;
-        if (deltaTs == 0 || IManager(manager).isInterestPaused()) return (0, borrowInterestGrowthGlobal);
+        if (deltaTs == 0 || IManager(manager).isInterestPaused(_pool)) return (0, borrowInterestGrowthGlobal);
         borrowIg = borrowInterestGrowthGlobal.rayMul(calculateCompoundedInterest(borrowRate, deltaTs));
         return (borrowRate, borrowIg);
     }
@@ -117,7 +117,7 @@ contract InterestLogic {
     /// @param amount amount
     /// @param borrowIg borrow interest growth
     /// @return borrow share
-    function getBorrowShare(uint256 amount, uint256 borrowIg) public view returns (uint256) {
+    function getBorrowShare(uint256 amount, uint256 borrowIg) public pure returns (uint256) {
         return amount.rayDiv(borrowIg);
     }
 
@@ -125,7 +125,7 @@ contract InterestLogic {
     /// @param borrowShare borrow share
     /// @param borrowIg borrow interest growth
     /// @return  borrow amount with the same precision of amount for the calculation when borrow
-    function getBorrowAmount(uint256 borrowShare, uint256 borrowIg) public view returns (uint256) {
+    function getBorrowAmount(uint256 borrowShare, uint256 borrowIg) public pure returns (uint256) {
         return borrowShare.rayMul(borrowIg);
     }
 }

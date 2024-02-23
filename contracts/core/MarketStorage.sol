@@ -6,7 +6,7 @@ import "../libraries/MarketDataStructure.sol";
 
 contract MarketStorage {
     // amount decimal 1e20
-    int256 public constant AMOUNT_PRECISION = 1e20;
+    int256 constant AMOUNT_PRECISION = 1e20;
 
     string public token;//indexToken，like `BTC_USD`,price key
     uint8 public marketType = 0;//contract type ,0:usd-m,1:coin-m,2:mix-m
@@ -19,7 +19,7 @@ contract MarketStorage {
 
     uint256 public positionID;//positionID
     uint256 public orderID;//orderID
-    uint256 public triggerOrderID = type(uint128).max;  //trigger Order ID
+    //uint256 public triggerOrderID = type(uint128).max;  //trigger Order ID
     //taker => key => positionID
     mapping(address => mapping(MarketDataStructure.PositionKey => uint256)) internal takerPositionList;//key: short;long;cross
     //taker => orderID[]
@@ -38,12 +38,13 @@ contract MarketStorage {
     int256 public fundingGrowthGlobalX96;
     //last update funding rate timestamp
     uint256 public lastFrX96Ts;//lastFrX96Ts
-    uint256 public lastExecutedOrderId;
+    //uint256 public lastExecutedOrderId;
 
     event Initialize(string indexToken, address _clearAnchor, address _pool, uint8 _marketType);
     event LogicAddressesModified(address _marketLogic, address _fundingLogic);
     event SetMarketConfig(MarketDataStructure.MarketConfig _marketConfig);
-    event ExecuteOrderError(uint256 _orderId, uint256 _errCode);
+    event ExecuteOrderLowLeveError(uint256 _orderId, bytes _errCode);
+    event ExecuteOrderError(uint256 _orderId, string _reason);
     event ExecuteInfo(
         uint256 id, 
         MarketDataStructure.OrderType orderType,
@@ -55,5 +56,5 @@ contract MarketStorage {
     );
     event UpdateMargin(uint256 id, int256 deltaMargin);
     event SwitchPositionMode(address taker, MarketDataStructure.PositionMode mode);
-    event DustPositionClosed(address taker, address market, uint256 positionId, uint256 amount, uint256 takerMargin, uint256 makerMargin, uint256 value, int256 fundingPayment, uint256 interestPayment);
+    event UpdateFundingRate(int256 fundingRate);
 }

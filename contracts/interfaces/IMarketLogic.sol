@@ -10,6 +10,7 @@ interface IMarketLogic {
         MarketDataStructure.OrderType action;
         uint256 discountRate;
         uint256 inviteRate;
+        uint256 clearPrice;
     }
 
     struct LiquidateInfoResponse {
@@ -27,11 +28,11 @@ interface IMarketLogic {
         uint256 indexPrice;
     }
 
-    function trade(uint256 id, uint256 positionId, uint256, uint256) external view returns (MarketDataStructure.Order memory order, MarketDataStructure.Position memory position, MarketDataStructure.TradeResponse memory response, uint256 errCode);
+    function trade(uint256 id, uint256 positionId, uint256, uint256) external returns (MarketDataStructure.Order memory order, MarketDataStructure.Position memory position, MarketDataStructure.TradeResponse memory response);
 
     function createOrderInternal(MarketDataStructure.CreateInternalParams memory params) external view returns (MarketDataStructure.Order memory order);
 
-    function getLiquidateInfo(LiquidityInfoParams memory params) external view returns (LiquidateInfoResponse memory response);
+    function getLiquidateInfo(LiquidityInfoParams memory params) external returns (LiquidateInfoResponse memory response);
 
     function isLiquidateOrProfitMaximum(MarketDataStructure.Position memory position, uint256 mm, uint256 indexPrice, uint256 toPrecision) external view returns (bool);
 
@@ -41,5 +42,5 @@ interface IMarketLogic {
 
     function checkSwitchMode(address _market, address _taker, MarketDataStructure.PositionMode _mode) external view;
 
-    function checkoutConfig(address market, MarketDataStructure.MarketConfig memory _config) external view;
+    function getIndexOrMarketPrice(address _market, bool _maximise, bool isIndexPrice) external view returns (uint256);
 }

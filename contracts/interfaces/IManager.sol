@@ -17,6 +17,10 @@ interface IManager {
 
     function checkPool(address _pool) external view returns (bool);
 
+    function checkMarketLogic(address _logic) external view returns (bool);
+
+    function checkMarketPriceFeed(address _feed) external view returns (bool);
+
     function cancelElapse() external view returns (uint256);
 
     function triggerOrderDuration() external view returns (uint256);
@@ -27,9 +31,9 @@ interface IManager {
 
     function getMarketMarginAsset(address) external view returns (address);
 
-    function isFundingPaused() external view returns (bool);
+    function isFundingPaused(address market) external view returns (bool);
 
-    function isInterestPaused() external view returns (bool);
+    function isInterestPaused(address pool) external view returns (bool);
 
     function executeOrderFee() external view returns (uint256);
 
@@ -46,4 +50,10 @@ interface IManager {
     function checkLiquidator(address _liquidator) external view returns (bool);
     
     function communityExecuteOrderDelay() external view returns (uint256);
+
+    function modifySingleInterestStatus(address pool, bool _interestPaused) external;
+
+    function modifySingleFundingStatus(address market, bool _fundingPaused) external;
+    
+    function router() external view returns (address);
 }

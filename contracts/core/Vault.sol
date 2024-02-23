@@ -153,6 +153,6 @@ contract Vault is ReentrancyGuard {
         emit CollectExchangeFee(_token, to, _fee);
     }
 
-    fallback() external payable {
+    receive() external payable {
     }
 }

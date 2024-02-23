@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.7.6;
+pragma abicoder v2;
 
 import "@chainlink/contracts/src/v0.7/interfaces/AggregatorV2V3Interface.sol";
 import "../libraries/SafeMath.sol";
@@ -60,9 +61,19 @@ contract MarketPriceFeed {
         require(_manager != address(0), "MarketPriceFeed: _manager is zero address");
         manager = _manager;
     }
-
+    
     modifier onlyController() {
         require(IManager(manager).checkController(msg.sender), "MarketPriceFeed: Must be controller");
+        _;
+    }
+
+    modifier onlyPool() {
+        require(IManager(manager).checkPool(msg.sender), "MarketPriceFeed: Must be pool");
+        _;
+    }
+
+    modifier onlyMarketLogic() {
+        require(IManager(manager).checkMarketLogic(msg.sender), "MarketPriceFeed: Must be market logic");
         _;
     }
 
@@ -129,7 +140,7 @@ contract MarketPriceFeed {
         emit SetTokenConfig(_token, _priceFeed, _priceDecimals, _isStrictStable);
     }
 
-    function getPrice(string memory _token, uint256 value, uint256 maxValue, bool _maximise) public view returns (uint256) {
+    function getPrice(string memory _token, bool _maximise) public view returns (uint256) {
         uint256 price = getPriceV1(_token, _maximise);
         uint256 adjustmentBps = adjustmentBasisPoints[_token];
         if (adjustmentBps > 0) {
@@ -141,10 +152,6 @@ contract MarketPriceFeed {
             }
         }
         
-        if (priceHelper != address(0)) {
-            price = IPriceHelper(priceHelper).getSlipPointPrice(_token, price, value, maxValue, _maximise);
-        }
-
         return price;
     }
 
@@ -246,8 +253,18 @@ contract MarketPriceFeed {
         return ISecondaryPriceFeed(secondaryPriceFeed).getIndexPrice(_token, getLatestPrimaryPrice(_token), _maximise);
     }
 
-    function priceForTrade(string memory _token, uint256 value, uint256 maxValue, bool _maximise) external view returns (uint256){
-        return getPrice(_token, value, maxValue, _maximise);
+    function priceForTrade(address pool, address market, string memory token, int8 takerDirection, uint256 deltaSize, uint256 deltaValue, bool isLiquidation) external onlyMarketLogic returns (uint256 size, uint256 vol, uint256 tradePrice){
+        bool maximise = takerDirection == 1;
+        uint256 price = getPrice(token, maximise);
+        IPriceHelper.CalcTradeInfoParams memory calcParams;
+        calcParams.pool = pool;
+        calcParams.market = market;
+        calcParams.indexPrice = price;
+        calcParams.isTakerLong = maximise;
+        calcParams.liquidation = isLiquidation;
+        calcParams.deltaSize = deltaSize;
+        calcParams.deltaValue = deltaValue;
+        (size, vol, tradePrice) = IPriceHelper(priceHelper).calcTradeInfo(calcParams);
     }
 
     function priceForPool(string memory _token, bool _maximise) external view returns (uint256){
@@ -260,5 +277,23 @@ contract MarketPriceFeed {
 
     function priceForIndex(string memory _token, bool _maximise) external view returns (uint256){
         return getIndexPrice(_token, _maximise);
+    }
+
+    function onLiquidityChanged(address pool, address market, uint256 indexPrice) external onlyPool {
+        IPriceHelper(priceHelper).onLiquidityChanged(pool, market, indexPrice);
+    }
+    
+    function getFundingRateX96PerSecond(address market) external view returns(int256 fundingRateX96){
+        fundingRateX96 = IPriceHelper(priceHelper).getFundingRateX96PerSecond(market);
+    }
+
+    function getMarketPrice(address market, string memory token, bool maximise) external view returns (uint256 marketPrice){
+        uint256 indexPrice = getPrice(token, maximise);
+        marketPrice = IPriceHelper(priceHelper).getMarketPrice(market, indexPrice);
+    }
+
+    function modifyMarketTickConfig(address pool, address market, string memory token, IPriceHelper.MarketTickConfig memory cfg) external onlyController {
+        uint256 indexPrice = getIndexPrice(token, false);
+        IPriceHelper(priceHelper).modifyMarketTickConfig(pool, market, cfg, indexPrice);
     }
 }

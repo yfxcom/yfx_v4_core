@@ -21,13 +21,14 @@ library MarketDataStructure {
         Liquidate,
         TakeProfit,
         UserTakeProfit,
-        UserStopLoss
+        UserStopLoss,
+        ClearAll
     }
 
     /// @notice position mode, one-way or hedge
     enum PositionMode{
-        OneWay,
-        Hedge
+        Hedge,
+        OneWay
     }
 
     enum PositionKey{
@@ -51,6 +52,7 @@ library MarketDataStructure {
         int256 frLastX96;           // last settled funding global cumulative value
         uint256 stopLossPrice;      // stop loss price of this position set by trader
         uint256 takeProfitPrice;    // take profit price of this position set by trader
+        bool useIP;                 // true if the tp/sl is executed by index price
         uint256 lastTPSLTs;         // last timestamp of trading setting the stop loss price or take profit price
         int256 fundingPayment;      // cumulative funding need to pay of this position
         uint256 debtShare;          // borrowed share of interest module
@@ -68,6 +70,7 @@ library MarketDataStructure {
         uint16 takerLeverage;                   // order leverage
         int8 triggerDirection;                  // price condition if order is trigger order: {0: not available, 1: >=, -1: <= }
         uint256 triggerPrice;                   // trigger price, 0: not available
+        bool useIP;                             // true if the order is executed by index price
         uint256 freezeMargin;                   // frozen margin of this order
         uint256 amount;                         // order amount
         uint256 multiplier;                     // multiplier of quanto perpetual contracts
@@ -97,7 +100,7 @@ library MarketDataStructure {
 
         uint256 interestPayment;                // settled interest amount
         
-        uint256 createTs;                         // create timestamp
+        uint256 createTs;                       // create timestamp
         OrderStatus status;                     // order status
         MarketDataStructure.PositionMode mode;  // margin mode, one-way or hedge
         bool isETH;                             // true if the margin is payed by ETH
@@ -140,6 +143,7 @@ library MarketDataStructure {
         int8 direction;             // order direction, validated in MarketLogic
         int8 triggerDirection;      // trigger condition, validated in MarketLogic
         uint256 triggerPrice;       // trigger price
+        bool useIP;                 // true if the order is executed by index price
         uint8 reduceOnly;           // 0: false, 1: true
         bool isLiquidate;           // is liquidate order, liquidate orders are generated automatically
         bool isETH;                 // true if order margin payed in ETH

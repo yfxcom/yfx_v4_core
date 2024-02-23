@@ -4,9 +4,12 @@ pragma abicoder v2;
 
 import "@openzeppelin/contracts/utils/EnumerableSet.sol";
 import "../libraries/SafeMath.sol";
-import "../libraries/PoolDataStructure.sol";
 import "../libraries/MarketDataStructure.sol";
 import "../libraries/TransferHelper.sol";
+import "../libraries/SafeCast.sol";
+import "../libraries/SignedSafeMath.sol";
+import "../libraries/ReentrancyGuard.sol";
+import "../libraries/Multicall.sol";
 import "../interfaces/IManager.sol";
 import "../interfaces/IERC20.sol";
 import "../interfaces/IWrappedCoin.sol";
@@ -18,27 +21,31 @@ import "../interfaces/IFastPriceFeed.sol";
 import "../interfaces/IInviteManager.sol";
 import "../interfaces/IMarketLogic.sol";
 import "../interfaces/IRewardRouter.sol";
+import "../interfaces/IOrder.sol";
 
-contract Router {
+contract Router is ReentrancyGuard, Multicall {
     using SafeMath for uint256;
+    using SafeMath for uint32;
+    using SignedSafeMath for int256;
+    using SafeCast for int256;
+    using SafeCast for uint256;
     using EnumerableSet for EnumerableSet.UintSet;
 
-    uint256 public batchExecuteLimit = 10;  //max batch execution orders limit
     address public manager;
     address fastPriceFeed;
     address riskFunding;
     address inviteManager;
     address marketLogic;
     address rewardRouter;
+    address poolOrder;
 
     //taker => market => orderId[]
     mapping(address => mapping(address => EnumerableSet.UintSet)) internal notExecuteOrderIds; // not executed order ids
     address public WETH;
 
 
-    event TakerOpen(address market, uint256 id);
-    event Open(address market, uint256 id, uint256 orderid);
-    event TakerClose(address market, uint256 id);
+    event OrderCreated(address market, uint256 id);
+    event OrderExecuted(address executer, address market, uint256 id, uint256 orderid);
     event Liquidate(address market, uint256 id, uint256 orderid, address liquidator);
     event TakeProfit(address market, uint256 id, uint256 orderid);
     event Cancel(address market, uint256 id);
@@ -47,8 +54,20 @@ contract Router {
     event RemoveLiquidity(uint256 id, address pool, uint256 liquidity);
     event ExecuteAddLiquidityOrder(uint256 id, address pool);
     event ExecuteRmLiquidityOrder(uint256 id, address pool);
-    event SetStopProfitAndLossPrice(uint256 id, address market, uint256 _profitPrice, uint256 _stopLossPrice);
-    event SetParams(address _fastPriceFeed, address _riskFunding, address _inviteManager, address _marketLogic, uint256 _batchExecuteLimit);
+    event SetStopProfitAndLossPrice(uint256 id, address market, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice);
+    event SetParams(address _fastPriceFeed, address _riskFunding, address _inviteManager, address _marketLogic, address _rewardRouter, address _order);
+    event CloseTakerPositionWithClearPrice(address market, uint256 id, uint256 orderid, uint256 cleearPrice);
+    event SetMakerTPSLPrice(address pool, uint256 positionId, uint256 profitPrice, uint256 stopLossPrice);
+    event UnstakeLpForAccountError(string error);
+    event UnstakeLpForAccountLowLevelError(bytes error);
+    event StakeLpForAccountError(string error);
+    event StakeLpForAccountLowLevelError(bytes error);
+    event ModifyStakeAmountError(string error);
+    event ModifyStakeAmountLowLevelError(bytes error);
+    event AddLiquidityError(string error);
+    event AddLiquidityLowLevelError(bytes error);
+    event RemoveLiquidityError(string error);
+    event RemoveLiquidityLowLevelError(bytes error);
 
     constructor(address _manager, address _WETH) {
         manager = _manager;
@@ -56,32 +75,37 @@ contract Router {
     }
 
     modifier whenNotPaused() {
-        require(!IManager(manager).paused(), "Market:system paused");
+        require(!IManager(manager).paused(), "RWN0");
         _;
     }
 
     modifier onlyController() {
-        require(IManager(manager).checkController(msg.sender), "Router: Must be controller");
+        require(IManager(manager).checkController(msg.sender), "ROC0");
+        _;
+    }
+
+    modifier onlyTreasurer() {
+        require(IManager(manager).checkTreasurer(msg.sender), "ROT0");
         _;
     }
 
     modifier onlyPriceProvider() {
-        require(IManager(manager).checkSigner(msg.sender), "Router: caller is not the price provider");
+        require(IManager(manager).checkSigner(msg.sender), "ROP0");
         _;
     }
 
     modifier ensure(uint256 deadline) {
-        require(deadline >= block.timestamp, 'Router: EXPIRED');
+        require(deadline >= block.timestamp, 'RE0');
         _;
     }
 
     modifier validateMarket(address _market){
-        require(IManager(manager).checkMarket(_market), "Router: market not registered");
+        require(IManager(manager).checkMarket(_market), "RVM0");
         _;
     }
 
     modifier validatePool(address _pool){
-        require(IManager(manager).checkPool(_pool), "Router: pool not registered");
+        require(IManager(manager).checkPool(_pool), "RVP0");
         _;
     }
 
@@ -90,16 +114,15 @@ contract Router {
     /// @param _riskFunding risk funding contract address
     /// @param _inviteManager invite manager contract address
     /// @param _marketLogic market logic contract address
-    /// @param _batchExecuteLimit max batch execute limit
-    function setConfigParams(address _fastPriceFeed, address _riskFunding, address _inviteManager, address _marketLogic, address _rewardRouter, uint256 _batchExecuteLimit) external onlyController {
-        require(_fastPriceFeed != address(0) && _riskFunding != address(0) && _inviteManager != address(0) && _marketLogic != address(0) && _batchExecuteLimit > 0, "Router: error params");
+    function setConfigParams(address _fastPriceFeed, address _riskFunding, address _inviteManager, address _marketLogic, address _rewardRouter, address _order) external onlyController {
+        require(_fastPriceFeed != address(0) && _riskFunding != address(0) && _inviteManager != address(0) && _marketLogic != address(0) && _order != address(0), "RSC0");
         fastPriceFeed = _fastPriceFeed;
         riskFunding = _riskFunding;
         inviteManager = _inviteManager;
         marketLogic = _marketLogic;
         rewardRouter = _rewardRouter;
-        batchExecuteLimit = _batchExecuteLimit;
-        emit SetParams(_fastPriceFeed, _riskFunding, _inviteManager, _marketLogic, _batchExecuteLimit);
+        poolOrder = _order;
+        emit SetParams(_fastPriceFeed, _riskFunding, _inviteManager, _marketLogic, _rewardRouter, _order);
     }
 
     /// @notice user open position parameters
@@ -113,6 +136,7 @@ contract Router {
         int8 direction;             // order direction, 1: long, -1: short
         int8 triggerDirection;      // trigger flag {1: index price >= trigger price, -1: index price <= trigger price}
         uint256 triggerPrice;
+        bool isExecutedByIndexPrice;
         uint256 deadline;
     }
 
@@ -126,6 +150,7 @@ contract Router {
         uint256 amount;             // position amount to close
         int8 triggerDirection;      // trigger flag {1: index price >= trigger price, -1: index price <= trigger price}
         uint256 triggerPrice;
+        bool isExecutedByIndexPrice;
         uint256 deadline;
     }
 
@@ -134,34 +159,20 @@ contract Router {
     /// @return id order id
     function takerOpen(TakerOpenParams memory params) external payable ensure(params.deadline) validateMarket(params._market) returns (uint256 id) {
         address marginAsset = getMarketMarginAsset(params._market);
-        uint256 executeOrderFee = getExecuteOrderFee();
-        require(IERC20(marginAsset).balanceOf(msg.sender) >= params.margin, "Router: insufficient balance");
-        require(IERC20(marginAsset).allowance(msg.sender, address(this)) >= params.margin, "Router: insufficient allowance");
-        require(msg.value == executeOrderFee, "Router: inaccurate msg.value");
-
-        TransferHelper.safeTransferFrom(marginAsset, msg.sender, params._market, params.margin);
-        id = _takerOpen(params, false);
-    }
-
-    /// @notice place an open-position order margined by ETH
-    /// @param params order params, detailed in the data structure declaration
-    /// @return id order id
-    function takerOpenETH(TakerOpenParams memory params) external payable ensure(params.deadline) validateMarket(params._market) returns (uint256 id) {
-        address marginAsset = getMarketMarginAsset(params._market);
-        /// @notice important can not remove
-        require(marginAsset == WETH, "Router: margin asset of this market is not WETH");
-
-        uint256 executeOrderFee = getExecuteOrderFee();
-        require(msg.value == params.margin.add(executeOrderFee), "Router: inaccurate value");
-
-        IWrappedCoin(WETH).deposit{value: params.margin}();
-        TransferHelper.safeTransfer(WETH, params._market, params.margin);
-
-        id = _takerOpen(params, true);
+        uint256 fee = getExecuteOrderFee();
+        bool isETH = marginAsset == WETH && msg.value > fee;
+        if (isETH) {
+            params.margin = msg.value.sub(fee);
+        } else {
+            require(msg.value == fee, "RTOE2");
+        }
+        require(params.margin > 0, "RTOE1");
+        _transferMargin(marginAsset, params._market, params.margin, isETH);
+        id = _takerOpen(params, isETH);
     }
 
     function _takerOpen(TakerOpenParams memory params, bool isETH) internal whenNotPaused returns (uint256 id) {
-        require(params.minPrice <= params.maxPrice, "Router: slippage price error");
+        require(params.minPrice <= params.maxPrice, "RTOP0");
 
         setReferralCode(params.inviterCode);
 
@@ -176,21 +187,22 @@ contract Router {
             direction: params.direction,
             triggerDirection: params.triggerDirection,
             triggerPrice: params.triggerPrice,
+            useIP: params.isExecutedByIndexPrice,
             reduceOnly: 0,
             isLiquidate: false,
             isETH: isETH
         }));
         EnumerableSet.add(notExecuteOrderIds[msg.sender][params._market], id);
-        emit TakerOpen(params._market, id);
+        emit OrderCreated(params._market, id);
     }
 
     /// @notice place a close-position order
     /// @param params order parameters, detailed in the data structure declaration
     /// @return id order id
     function takerClose(TakerCloseParams memory params) external payable ensure(params.deadline) validateMarket(params._market) whenNotPaused returns (uint256 id){
-        require(params.minPrice <= params.maxPrice, "Router: slippage price error");
+        require(params.minPrice <= params.maxPrice, "RTCL0");
         uint256 executeOrderFee = getExecuteOrderFee();
-        require(msg.value == executeOrderFee, "Router: insufficient execution fee");
+        require(msg.value == executeOrderFee, "RTCL1");
 
         setReferralCode(params.inviterCode);
 
@@ -205,129 +217,83 @@ contract Router {
             direction: 0,
             triggerDirection: params.triggerDirection,
             triggerPrice: params.triggerPrice,
+            useIP: params.isExecutedByIndexPrice,
             reduceOnly: 1,
             isLiquidate: false,
             isETH: false
         }));
         EnumerableSet.add(notExecuteOrderIds[msg.sender][params._market], id);
-        emit TakerClose(params._market, id);
+        emit OrderCreated(params._market, id);
     }
 
-    /// @notice batch execution of orders
+    /// @notice execute order
     /// @param _market market contract address
-    /// @param _ids trigger order ids
-    /// @param _tokens index token name array
-    /// @param _prices token prices array
-    /// @param _timestamps token prices timestamps array
-    function batchExecuteOrder(
-        address _market,
-        uint256[] memory _ids,
-        string[] memory _tokens,
-        uint128[] memory _prices,
-        uint32[] memory _timestamps
-    ) external onlyPriceProvider validateMarket(_market) {
-        setPrices(_tokens, _prices, _timestamps);
-        // execute trigger orders
-        uint256 maxExecuteOrderNum;
-        if (_ids.length > batchExecuteLimit) {
-            maxExecuteOrderNum = batchExecuteLimit;
-        } else {
-            maxExecuteOrderNum = _ids.length;
-        }
-        for (uint256 i = 0; i < maxExecuteOrderNum; i++) {
-            MarketDataStructure.Order memory order = IMarket(_market).getOrder(_ids[i]);
-            if (order.orderType == MarketDataStructure.OrderType.TriggerOpen || order.orderType == MarketDataStructure.OrderType.TriggerClose) {
-                _executeOrder(order, msg.sender);
+    /// @param _orderId order id
+    function executeOrder(address _market, uint256 _orderId) external nonReentrant validateMarket(_market) {
+        MarketDataStructure.Order memory order = IMarket(_market).getOrder(_orderId);
+        require(_shouldExecute(msg.sender, order.createTs), "REO0");
+
+        if (order.id != 0 && order.status == MarketDataStructure.OrderStatus.Open) {
+            (int256 resultCode,uint256 positionId, bool isAllClosed) = IMarket(_market).executeOrder(_orderId);
+            if (resultCode == 0) {
+                EnumerableSet.remove(notExecuteOrderIds[order.taker][order.market], order.id);
+                _modifyStakeAmount(order.market, order.taker, isAllClosed);
             }
-        }
-
-        // execute market orders (non-trigger)
-        (uint256 start,uint256 end) = getLastExecuteOrderId(_market);
-        for (uint256 i = start; i < end; i++) {
-            MarketDataStructure.Order memory order = IMarket(_market).getOrder(i);
-            _executeOrder(order, msg.sender);
-        }
-    }
-
-    /// @notice batch execution of orders by the community, only market orders supported
-    /// @param _market market contract address
-    function batchExecuteOrderByCommunity(address _market) external validateMarket(_market) {
-        // execute market orders
-        (uint256 start,uint256 end) = getLastExecuteOrderId(_market);
-        for (uint256 i = start; i < end; i++) {
-            MarketDataStructure.Order memory order = IMarket(_market).getOrder(i);
-            if (
-                order.orderType != MarketDataStructure.OrderType.TriggerOpen &&
-                order.orderType != MarketDataStructure.OrderType.TriggerClose &&
-                block.timestamp > order.createTs.add(IManager(manager).communityExecuteOrderDelay())
-            ) {
-                _executeOrder(order, msg.sender);
-            }
-        }
-    }
-
-    /// @notice execute an order
-    /// @param order  order info
-    /// @param to the address to receive the execution fee
-    function _executeOrder(MarketDataStructure.Order memory order, address to) internal {
-        if (order.status == MarketDataStructure.OrderStatus.Open) {
-            (int256 resultCode,uint256 positionId) = IMarket(order.market).executeOrder(order.id);
-            if (resultCode == 0) EnumerableSet.remove(notExecuteOrderIds[order.taker][order.market], order.id);
             if (resultCode == 0 || resultCode == 1) {
-                TransferHelper.safeTransferETH(to, order.executeFee);
+                TransferHelper.safeTransferETH(msg.sender, order.executeFee);
             }
-            emit Open(order.market, positionId, order.id);
+            emit OrderExecuted(msg.sender, order.market, positionId, order.id);
         }
+    }
+
+    /// @notice execute position liquidation, take profit and tpsl
+    function executePositionTrigger(address _market, uint256 id, MarketDataStructure.OrderType action) external nonReentrant onlyPriceProvider {
+        _liquidate(msg.sender, _market, id, action, 0);
     }
 
     /// @notice execute position liquidation, take profit and tpsl
     /// @param _market  market contract address
     /// @param id   position id
-    /// @param action   reason and how to end the position
-    /// @param _tokens  price tokens
-    /// @param _prices  price
-    /// @param _timestamps   price timestamp array
-    function liquidate(address _market, uint256 id, MarketDataStructure.OrderType action, string[] memory _tokens, uint128[] memory _prices, uint32[] memory _timestamps) external validateMarket(_market) {
-        require(IManager(manager).checkLiquidator(msg.sender), "Router: only liquidators");
-        setPrices(_tokens, _prices, _timestamps);
-        uint256 orderId = IMarket(_market).liquidate(id, action);
+    function liquidate(address _market, uint256 id) external nonReentrant {
+        _liquidate(msg.sender, _market, id, MarketDataStructure.OrderType.Liquidate, 0);
+    }
+
+    function closeTakerPositionWithClearPrice(address _pool, address _market, uint256 _positionId, uint256 _clearPrice) external nonReentrant onlyPriceProvider {
+        require(IPool(_pool).clearAll(), "RCTP0");
+        _liquidate(msg.sender, _market, _positionId, MarketDataStructure.OrderType.ClearAll, _clearPrice);
+    }
+
+    function _liquidate(address _caller, address _market, uint256 id, MarketDataStructure.OrderType action, uint256 _clearPrice) internal validateMarket(_market) {
+        MarketDataStructure.Position memory position = IMarket(_market).getPosition(id);
+        uint256 orderId = IMarket(_market).liquidate(id, action, _clearPrice);
         if (MarketDataStructure.OrderType.Liquidate == action) {
-            IRiskFunding(riskFunding).updateLiquidatorExecutedFee(msg.sender);
+            IRiskFunding(riskFunding).updateLiquidatorExecutedFee(_caller);
         }
-        emit Liquidate(_market, id, orderId, msg.sender);
-    }
 
-    /// @notice execute position liquidation
-    /// @param _market  market contract address
-    /// @param id   position id
-    function liquidateByCommunity(address _market, uint256 id) external validateMarket(_market) {
-        uint256 orderId = IMarket(_market).liquidate(id, MarketDataStructure.OrderType.Liquidate);
-        IRiskFunding(riskFunding).updateLiquidatorExecutedFee(msg.sender);
-        emit Liquidate(_market, id, orderId, msg.sender);
-    }
+        _modifyStakeAmount(_market, position.taker, true);
 
-    /// @notice  increase margin to a position, margined by ETH
-    /// @param _market  market contract address
-    /// @param _id  position id
-    function increaseMarginETH(address _market, uint256 _id) external payable validateMarket(_market) {
-        address vault = IManager(manager).vault();
-        address marginAsset = getMarketMarginAsset(_market);
-        /// @notice important, can not remove, or 100 ETH can be used as 100 USDC
-        require(marginAsset == WETH, "Router: margin is not WETH");
-        IWrappedCoin(WETH).deposit{value: msg.value}();
-        TransferHelper.safeTransfer(WETH, vault, msg.value);
-        _updateMargin(_market, _id, msg.value, true);
+        emit Liquidate(_market, id, orderId, _caller);
     }
 
     /// @notice  add margin to a position, margined by ERC20 tokens
     /// @param _market  market contract address
     /// @param _id  position id
     /// @param _value  add margin value
-    function increaseMargin(address _market, uint256 _id, uint256 _value) external validateMarket(_market) {
+    function increaseMargin(address _market, uint256 _id, uint256 _value) external payable validateMarket(_market) {
         address marginAsset = getMarketMarginAsset(_market);
-        address vault = IManager(manager).vault();
-        TransferHelper.safeTransferFrom(marginAsset, msg.sender, vault, _value);
+        bool isETH = marginAsset == WETH && msg.value > 0;
+        _value = isETH ? msg.value : _value;
+        _transferMargin(marginAsset, IManager(manager).vault(), _value, isETH);
         _updateMargin(_market, _id, _value, true);
+    }
+
+    function _transferMargin(address asset, address to, uint256 amount, bool isETH) internal {
+        if (isETH) {
+            IWrappedCoin(WETH).deposit{value: amount}();
+            TransferHelper.safeTransfer(WETH, to, amount);
+        } else {
+            TransferHelper.safeTransferFrom(asset, msg.sender, to, amount);
+        }
     }
 
     /// @notice  remove margin from a position
@@ -339,20 +305,18 @@ contract Router {
     }
 
     function _updateMargin(address _market, uint256 _id, uint256 _deltaMargin, bool isIncrease) internal whenNotPaused {
-        require(_deltaMargin != 0, "Router: wrong value for remove margin");
+        require(_deltaMargin != 0, "MUM0");
         MarketDataStructure.Position memory position = IMarket(_market).getPosition(_id);
         MarketDataStructure.MarketConfig memory marketConfig = IMarket(_market).getMarketConfig();
-        require(position.taker == msg.sender, "Router: caller is not owner");
-        require(position.amount > 0, "Router: position not exist");
+        require(position.taker == msg.sender && position.amount > 0, "MUM1");
 
         if (isIncrease) {
             position.takerMargin = position.takerMargin.add(_deltaMargin);
-            require(position.takerMargin <= marketConfig.takerMarginMax && position.makerMargin >= position.takerMargin, 'Router: margin exceeded limit');
+            require(position.takerMargin <= marketConfig.takerMarginMax && position.makerMargin >= position.takerMargin, 'MUM2');
         } else {
             //get max decrease margin amount
             (uint256 maxDecreaseMargin) = IMarketLogic(marketLogic).getMaxTakerDecreaseMargin(position);
             if (maxDecreaseMargin < _deltaMargin) _deltaMargin = maxDecreaseMargin;
-            position.takerMargin = position.takerMargin.sub(_deltaMargin);
         }
 
         IMarket(_market).updateMargin(_id, _deltaMargin, isIncrease);
@@ -365,8 +329,11 @@ contract Router {
         address marginAsset = getMarketMarginAsset(_market);
         MarketDataStructure.Order memory order = IMarket(_market).getOrder(id);
         if (!IManager(manager).checkSigner(msg.sender)) {
-            require(order.taker == msg.sender, "Router: not owner");
-            require(order.createTs.add(IManager(manager).cancelElapse()) <= block.timestamp, "Router: can not cancel until deadline");
+            require(
+                order.taker == msg.sender
+                && order.createTs.add(IManager(manager).cancelElapse()) <= block.timestamp,
+                "MORC0"
+            );
         }
 
         IMarket(_market).cancel(id);
@@ -390,12 +357,15 @@ contract Router {
     /// @param _id  position id
     /// @param _profitPrice take-profit price
     /// @param _stopLossPrice stop-loss price
-    function setTPSLPrice(address _market, uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice) external validateMarket(_market) whenNotPaused {
+    function setTPSLPrice(address _market, uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice) external payable validateMarket(_market) whenNotPaused {
         MarketDataStructure.Position memory position = IMarket(_market).getPosition(_id);
-        require(position.taker == msg.sender, "Router: not taker");
-        require(position.amount > 0, "Router: no position");
-        IMarket(_market).setTPSLPrice(_id, _profitPrice, _stopLossPrice);
-        emit SetStopProfitAndLossPrice(_id, _market, _profitPrice, _stopLossPrice);
+        require(
+            position.taker == msg.sender
+            && position.amount > 0,
+            "MSTP0"
+        );
+        IMarket(_market).setTPSLPrice(_id, _profitPrice, _stopLossPrice, _isExecutedByIndexPrice);
+        emit SetStopProfitAndLossPrice(_id, _market, _profitPrice, _stopLossPrice, _isExecutedByIndexPrice);
     }
 
     /// @notice user modify position mode
@@ -407,132 +377,188 @@ contract Router {
     }
 
     /// @notice update offChain price by price provider
-    /// @param _tokens  index token name array
-    /// @param _prices  price array
-    /// @param _timestamps  timestamp array
-    function setPrices(string[] memory _tokens, uint128[] memory _prices, uint32[] memory _timestamps) public onlyPriceProvider {
-        IFastPriceFeed(fastPriceFeed).setPrices(_tokens, _prices, _timestamps);
+    /// @param backupPrices  backup price array
+    /// @param primaryPrices primary price array
+    function setPrices(bytes memory backupPrices, bytes memory primaryPrices) public payable onlyPriceProvider {
+        IFastPriceFeed(fastPriceFeed).setPrices{value: msg.value}(backupPrices, primaryPrices);
     }
 
-    /// @notice add liquidity to the pool by using ETH
-    /// @param _pool  the pool to add liquidity
-    /// @param _amount the amount to add liquidity
-    /// @param _deadline the deadline time to add liquidity order
-    function addLiquidityETH(address _pool, uint256 _amount, bool isStakeLp, uint256 _deadline) external payable ensure(_deadline) validatePool(_pool) returns (bool result, uint256 id){
-        address baseAsset = IPool(_pool).getBaseAsset();
-        require(baseAsset == WETH, "Router: baseAsset is not WETH");
-        require(msg.value == _amount, "Router: inaccurate balance");
-        IWrappedCoin(WETH).deposit{value: msg.value}();
-        TransferHelper.safeTransfer(WETH, IManager(manager).vault(), msg.value);
-        (uint256 _id) = IPool(_pool).addLiquidity(msg.sender, _amount);
-        result = true;
-        id = _id;
-        emit AddLiquidity(_id, _pool, _amount);
-
-        _executeLiquidityOrder(_pool, _id, true, isStakeLp);
+    function _shouldExecute(address _caller, uint256 _createTs) internal view returns (bool){
+        if (IManager(manager).checkSigner(_caller)) return true;
+        if (_createTs.add(IManager(manager).communityExecuteOrderDelay()) > block.timestamp) return true;
+        return false;
     }
-
-
-    /// @notice add liquidity to the pool by using ERC20 tokens
-    /// @param _pool  the pool to add liquidity
-    /// @param _amount the amount to add liquidity
-    /// @param _deadline the deadline time to add liquidity order
-    function addLiquidity(address _pool, uint256 _amount, bool isStakeLp, uint256 _deadline) external ensure(_deadline) validatePool(_pool) returns (bool result, uint256 id){
-        address baseAsset = IPool(_pool).getBaseAsset();
-        require(IERC20(baseAsset).balanceOf(msg.sender) >= _amount, "Router: insufficient balance");
-        require(IERC20(baseAsset).allowance(msg.sender, address(this)) >= _amount, "Router: insufficient allowance");
-        TransferHelper.safeTransferFrom(baseAsset, msg.sender, IManager(manager).vault(), _amount);
-        (uint256 _id) = IPool(_pool).addLiquidity(msg.sender, _amount);
-        result = true;
-        id = _id;
-
-        emit AddLiquidity(_id, _pool, _amount);
-
-        _executeLiquidityOrder(_pool, _id, false, isStakeLp);
-    }
-
-    /// @notice execute liquidity orders
-    /// @param _pool pool address
-    /// @param _id liquidity order id
-    function _executeLiquidityOrder(address _pool, uint256 _id, bool isETH, bool isStake) internal {
-        //IPool(_pool).updateBorrowIG();
-        PoolDataStructure.MakerOrder memory order = IPool(_pool).getOrder(_id);
-        if (order.action == PoolDataStructure.PoolAction.Deposit) {
-            (uint256 liquidity) = IPool(_pool).executeAddLiquidityOrder(_id);
-            if (isStake && rewardRouter != address(0)) {
-                IRewardRouter(rewardRouter).stakeLpForAccount(order.maker, _pool, liquidity);
+    
+    function _modifyStakeAmount(address market, address taker, bool isAllClose) internal {
+        if (rewardRouter != address(0)) {
+            try IRewardRouter(rewardRouter).modifyStakedPosition(market, taker, isAllClose){}
+            catch Error(string memory reason){
+                emit ModifyStakeAmountError(reason);
             }
-            emit ExecuteAddLiquidityOrder(_id, _pool);
+            catch (bytes memory error){
+                emit ModifyStakeAmountLowLevelError(error);
+            }
+        }
+    }
+
+    /// @notice create pool order
+    /// @param _params order params
+    /// @param _deadline deadline
+    function createPoolOrder(IOrder.CreateOrderParams memory _params, uint256 _deadline) external payable ensure(_deadline) validatePool(_params.pool) {
+        uint256 fee = getExecuteOrderFee();
+        if (_params.orderType == IOrder.PoolOrderType.Increase) {
+            address baseAsset = IPool(_params.pool).getBaseAsset();
+            bool isETH = baseAsset == WETH && msg.value > fee;
+            if (isETH) {
+                _params.margin = msg.value.sub(fee);
+                require(_params.margin > 0, "MCRP0");
+            } else {
+                require(msg.value == fee, "MCRP1");
+            }
+            _transferMargin(baseAsset, poolOrder, _params.margin, isETH);
         } else {
-            IPool(_pool).executeRmLiquidityOrder(_id, isETH);
-            emit ExecuteRmLiquidityOrder(_id, _pool);
+            require(msg.value == fee, "MCRP2");
+        }
+        IOrder(poolOrder).createOrder(_params);
+    }
+
+    /// @notice cancel pool order
+    //// @param _orderId order id
+    function cancelPoolOrder(uint256 _orderId) external {
+        IOrder.PoolOrder memory order = IOrder(poolOrder).getPoolOrder(_orderId);
+        require(
+            order.maker == msg.sender
+            && order.status == IOrder.PoolOrderStatus.Submit
+            && order.createTs.add(uint32(IManager(manager).cancelElapse())) <= block.timestamp,
+            "MCPO0"
+        );
+        _updatePoolOrderStatus(order, IOrder.PoolOrderStatus.Cancel);
+    }
+
+    /// @notice execute pool order
+    /// @param _orderId order id
+    function executePoolOrder(uint256 _orderId) external onlyPriceProvider returns (bool isSuccess) {
+        IOrder.PoolOrder memory order = IOrder(poolOrder).getPoolOrder(_orderId);
+        require(order.status == IOrder.PoolOrderStatus.Submit && order.id > 0, "MEPO0");
+        isSuccess = order.orderType == IOrder.PoolOrderType.Increase ? _addLiquidity(order) :
+            _removeLiquidity(order.id, order.pool, order.maker, order.liquidity, order.isUnStakeLp, order.isETH, false);
+        _updatePoolOrderStatus(order, isSuccess ? IOrder.PoolOrderStatus.Success : IOrder.PoolOrderStatus.Fail);
+    }
+
+    /// @notice remove liquidity by system ,tp/sl
+    /// @param _pool pool address
+    /// @param _maker maker address
+    /// @param isReceiveETH whether receive ETH
+    function removeLiquidityBySystem(address _pool, address _maker, bool isReceiveETH) external onlyPriceProvider {
+        _removeLiquidity(0, _pool, _maker, type(uint256).max, true, isReceiveETH, true);
+    }
+
+    function _addLiquidity(IOrder.PoolOrder memory order) internal returns (bool isAddSuccess){
+        try IPool(order.pool).addLiquidity(order.id, order.maker, order.margin, order.leverage) returns (uint256 liquidity){
+            isAddSuccess = true;
+            if (order.isStakeLp && rewardRouter != address(0)) {
+                try IRewardRouter(rewardRouter).stakeLpForAccount(order.maker, order.pool, liquidity){}
+                catch Error(string memory reason){
+                    emit StakeLpForAccountError(reason);
+                }
+                catch (bytes memory error){
+                    emit StakeLpForAccountLowLevelError(error);
+                }
+            }
+        }
+        catch Error(string memory reason){
+            isAddSuccess = false;
+            emit AddLiquidityError(reason);
+        }
+        catch (bytes memory error){
+            isAddSuccess = false;
+            emit AddLiquidityLowLevelError(error);
         }
     }
 
-    /// @notice remove liquidity from the pool, get ERC20 tokens
-    /// @param _pool  which pool address to remove liquidity
-    /// @param _liquidity liquidity amount to remove
-    /// @param _deadline deadline time
-    /// @return result result of cancel the order
-    /// @return id order id for remove liquidity
-    function removeLiquidity(address _pool, uint256 _liquidity, bool isUnStake, uint256 _deadline) external ensure(_deadline) validatePool(_pool) returns (bool result, uint256 id){
-        if (isUnStake && rewardRouter != address(0)) {
-            uint256 lpBalance = IERC20(_pool).balanceOf(msg.sender);
-            if (lpBalance < _liquidity) {
-                IRewardRouter(rewardRouter).unstakeLpForAccount(msg.sender, _pool, _liquidity.sub(lpBalance));
-            }
+    function _removeLiquidity(uint256 _orderId, address _pool, address _maker, uint256 _liquidity, bool _isUnStake, bool _isReceiveETH, bool _isSystem) internal returns (bool isRemoveSuccess){
+        _preRemoveLiquidity(_maker, _pool, _liquidity, _isUnStake, false);
+        try IPool(_pool).removeLiquidity(_orderId, _maker, _liquidity, IPool(_pool).getBaseAsset() == WETH ? _isReceiveETH : false, _isSystem){
+            isRemoveSuccess = true;
         }
-
-        (uint256 _id, uint256 _value) = IPool(_pool).removeLiquidity(msg.sender, _liquidity);
-        result = true;
-        id = _id;
-        emit RemoveLiquidity(_id, _pool, _value);
-
-        _executeLiquidityOrder(_pool, _id, false, false);
+        catch Error(string memory reason){
+            isRemoveSuccess = false;
+            emit RemoveLiquidityError(reason);
+        }
+        catch (bytes memory error){
+            isRemoveSuccess = false;
+            emit RemoveLiquidityLowLevelError(error);
+        }
     }
 
+    function _updatePoolOrderStatus(IOrder.PoolOrder memory order, IOrder.PoolOrderStatus status) internal {
+        // refund or send execute fee
+        TransferHelper.safeTransferETH(status == IOrder.PoolOrderStatus.Success ? msg.sender : order.maker, order.executeFee);
+        IOrder(poolOrder).updatePoolOrder(order.id, status);
+    }
 
-    /// @notice execute remove liquidity orders, get ETH if and only if the base asset of the pool is WETH
-    /// @param _pool  which pool address to remove liquidity
-    /// @param _liquidity liquidity amount to remove
-    /// @param _deadline deadline time
-    /// @return result result of cancel the order
-    /// @return id order id for remove liquidity
-    function removeLiquidityETH(address _pool, uint256 _liquidity, bool isUnStake, uint256 _deadline) external ensure(_deadline) validatePool(_pool) returns (bool result, uint256 id){
-        require(IPool(_pool).getBaseAsset() == WETH, "Router: baseAsset is not WETH");
+    /// @notice set the take-profit and stop-loss price for a maker position
+    /// @param _pool pool address
+    /// @param _positionId position id
+    /// @param _profitPrice take-profit price
+    /// @param _stopLossPrice stop-loss price
+    function setMakerTPSLPrice(address _pool, uint256 _positionId, uint256 _profitPrice, uint256 _stopLossPrice) external payable validatePool(_pool) {
+        IPool(_pool).setTPSLPrice(msg.sender, _positionId, _profitPrice, _stopLossPrice);
+        emit SetMakerTPSLPrice(_pool, _positionId, _profitPrice, _stopLossPrice);
+    }
 
+    /// @notice liquidate the liquidity position
+    /// @param _pool pool address
+    /// @param _positionId position id
+    function liquidateLiquidityPosition(address _pool, uint256 _positionId) external {
+        _liquidateLiquidityPosition(_pool, _positionId);
+        IRiskFunding(riskFunding).updateLiquidatorExecutedFee(msg.sender);
+    }
+
+    /// @notice clear the maker position
+    /// @param _pool pool address
+    /// @param _positionId position id
+    function clearMakerPosition(address _pool, uint256 _positionId) external onlyPriceProvider {
+        _liquidateLiquidityPosition(_pool, _positionId);
+    }
+
+    function _liquidateLiquidityPosition(address _pool, uint256 _positionId) internal {
+        IPool.Position memory position = IPool(_pool).makerPositions(_positionId);
+        _preRemoveLiquidity(position.maker, _pool, position.liquidity, true, true);
+        IPool(_pool).liquidate(_positionId);
+    }
+
+    function _preRemoveLiquidity(address sender, address _pool, uint256 _liquidity, bool isUnStake, bool isLiquidate) internal {
         if (isUnStake && rewardRouter != address(0)) {
-            uint256 lpBalance = IERC20(_pool).balanceOf(msg.sender);
+            uint256 lpBalance = IERC20(_pool).balanceOf(sender);
             if (lpBalance < _liquidity) {
-                IRewardRouter(rewardRouter).unstakeLpForAccount(msg.sender, _pool, _liquidity.sub(lpBalance));
+                try IRewardRouter(rewardRouter).unstakeLpForAccount(sender, _pool, _liquidity.sub(lpBalance), isLiquidate) {}
+                catch Error(string memory reason){
+                    emit UnstakeLpForAccountError(reason);
+                }
+                catch (bytes memory error){
+                    emit UnstakeLpForAccountLowLevelError(error);
+                }
             }
         }
+    }
 
-        (uint256 _id, uint256 _value) = IPool(_pool).removeLiquidity(msg.sender, _liquidity);
-        result = true;
-        id = _id;
-        emit RemoveLiquidity(_id, _pool, _value);
-
-        _executeLiquidityOrder(_pool, _id, true, false);
+    /// @notice add margin to a maker position
+    /// @param pool pool address
+    /// @param positionId position id
+    /// @param addMargin add margin value
+    function addMakerPositionMargin(address pool, uint256 positionId, uint256 addMargin) external payable validatePool(pool) {
+        address baseAsset = IPool(pool).getBaseAsset();
+        bool isETH = baseAsset == WETH && msg.value > 0;
+        addMargin = isETH ? msg.value : addMargin;
+        _transferMargin(baseAsset, IManager(manager).vault(), addMargin, isETH);
+        IPool(pool).addMakerPositionMargin(positionId, addMargin);
     }
 
     /// @notice set the referral code for the trader
     /// @param inviterCode the inviter code
     function setReferralCode(bytes32 inviterCode) internal {
         IInviteManager(inviteManager).setTraderReferralCode(msg.sender, inviterCode);
-    }
-
-    /// @notice calculate the execution order ids
-    /// @param _market market address
-    /// @return start start order id
-    /// @return end end order id
-    function getLastExecuteOrderId(address _market) public view returns (uint256 start, uint256 end){
-        uint256 lastOrderId = IMarket(_market).orderID();
-        start = IMarket(_market).lastExecutedOrderId();
-        uint256 deltaNum = lastOrderId.sub(start);
-        if (deltaNum > batchExecuteLimit) deltaNum = batchExecuteLimit;
-        start = start.add(1);
-        end = start.add(deltaNum);
     }
 
     /// @notice get the not execute order ids
@@ -557,6 +583,11 @@ contract Router {
         return IManager(manager).executeOrderFee();
     }
 
-    fallback() external payable {
+    /// @notice transfer the execution fee to the update router by the treasurer
+    function withdrawExecuteFee() external onlyTreasurer {
+        TransferHelper.safeTransferETH(IManager(manager).router(), address(this).balance);
+    }
+
+    receive() external payable {
     }
 }

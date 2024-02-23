@@ -27,10 +27,16 @@ contract MarketLogic is IMarketLogic {
     address marketPriceFeed;
 
     event UpdateMarketPriceFeed(address marketPriceFeed);
+    event DustPositionClosed(address taker, address market, uint256 positionId, uint256 amount, uint256 takerMargin, uint256 makerMargin, uint256 value, int256 fundingPayment, uint256 interestPayment);
 
     constructor(address _manager) {
         require(_manager != address(0), "MarketLogic: manager is zero address");
         manager = _manager;
+    }
+
+    modifier onlyMarket() {
+        require(IManager(manager).checkMarket(msg.sender), "MarketLogic: Must be market");
+        _;
     }
 
     function updateMarketPriceFeed(address _marketPriceFeed) external {
@@ -65,6 +71,7 @@ contract MarketLogic is IMarketLogic {
         uint256 feeForPositionReversal;     // fee charged by position reversal part
         uint256 feeToDiscountSettle;        // fee discount of the origin part
         int256 toTaker;                     // refund to the taker
+        uint256 tmpMakerMargin;
     }
 
     /// @notice trade logic, calculate all things when an order is executed
@@ -75,8 +82,7 @@ contract MarketLogic is IMarketLogic {
     /// @return order order
     /// @return position position
     /// @return response response detailed in the data structure declaration
-    /// @return errorCode errorCode {0: success, non-zero: fail}
-    function trade(uint256 id, uint256 positionId, uint256 discountRate, uint256 inviteRate) external view override returns (MarketDataStructure.Order memory order, MarketDataStructure.Position memory position, MarketDataStructure.TradeResponse memory response, uint256 errorCode) {
+    function trade(uint256 id, uint256 positionId, uint256 discountRate, uint256 inviteRate) external override onlyMarket returns (MarketDataStructure.Order memory order, MarketDataStructure.Position memory position, MarketDataStructure.TradeResponse memory response) {
         // init parameters and configurations to be used
         TradeInternalParams memory iParams;
         iParams.marketConfig = IMarket(msg.sender).getMarketConfig();
@@ -85,18 +91,7 @@ contract MarketLogic is IMarketLogic {
         order = IMarket(msg.sender).getOrder(id);
         iParams.positionMode = IMarket(msg.sender).positionModes(order.taker);
         position = IMarket(msg.sender).getPosition(positionId);
-
-        if (order.id == 0 || order.status != MarketDataStructure.OrderStatus.Open) return (order, position, response, 2);
-
-        // trigger condition validation
-        if (order.triggerPrice > 0) {
-            if (block.timestamp >= order.createTs.add(IManager(manager).triggerOrderDuration())) return (order, position, response, 4);
-            iParams.indexPrice = getIndexPrice(msg.sender, order.direction == 1);
-            // trigger direction: 1 indicates >=, -1 indicates <=
-            if (order.triggerDirection == 1 ? iParams.indexPrice < order.triggerPrice : iParams.indexPrice > order.triggerPrice) return (order, position, response, 5);
-            order.tradeIndexPrice = iParams.indexPrice;
-        }
-
+        
         // position initiation if empty
         if (position.amount == 0) {
             position.id = positionId;
@@ -111,84 +106,54 @@ contract MarketLogic is IMarketLogic {
             position.lastTPSLTs = 0;
         } else {
             // ensure the same leverage in order and position if the position is not empty
-            if (position.takerLeverage != order.takerLeverage) return (order, position, response, 6);
+            require(position.takerLeverage == order.takerLeverage,"MT0");
         }
 
         // get trading price, calculate delta amount and delta value
         if (order.orderType == MarketDataStructure.OrderType.Open || order.orderType == MarketDataStructure.OrderType.TriggerOpen) {
             iParams.orderValue = adjustPrecision(order.freezeMargin.mul(order.takerLeverage), iParams.marketConfig.marketAssetPrecision, AMOUNT_PRECISION);
-            if (iParams.marketType == 0 || iParams.marketType == 2) {
-                if (iParams.marketType == 2) {
-                    iParams.orderValue = iParams.orderValue.mul(RATE_PRECISION).div(position.multiplier);
-                }
-                iParams.price = getPrice(order.market, iParams.orderValue, iParams.marketConfig.takerValueMax, order.direction == 1);
-                if (iParams.price == 0) return (order, position, response, 1);
-
-                iParams.deltaAmount = iParams.orderValue.mul(PRICE_PRECISION).div(iParams.price);
-            } else {
-                iParams.price = getPrice(order.market, iParams.orderValue, iParams.marketConfig.takerValueMax, order.direction == 1);
-                if (iParams.price == 0) return (order, position, response, 1);
-
-                iParams.deltaAmount = iParams.orderValue.mul(iParams.price).div(PRICE_PRECISION);
+            if (iParams.marketType == 2) {
+                iParams.orderValue = iParams.orderValue.mul(RATE_PRECISION).div(position.multiplier);
             }
         } else {
-            if (position.amount == 0 || position.direction == order.direction) return (order, position, response, 7);
+            require(position.amount != 0 && position.direction != order.direction,"MT1");
             iParams.deltaAmount = position.amount >= order.amount ? order.amount : position.amount;
-            iParams.closeRatio = iParams.deltaAmount.mul(AMOUNT_PRECISION).div(position.amount);
-
-            iParams.price = getPrice(order.market, position.value.mul(iParams.closeRatio).div(AMOUNT_PRECISION), iParams.marketConfig.takerValueMax, order.direction == 1);
-            if (iParams.price == 0) return (order, position, response, 1);
-
-            if (iParams.marketType == 0 || iParams.marketType == 2) {
-                iParams.orderValue = iParams.deltaAmount.mul(iParams.price).div(PRICE_PRECISION);
-            } else {
-                iParams.orderValue = iParams.deltaAmount.mul(PRICE_PRECISION).div(iParams.price);
-            }
         }
-
-        if ((order.takerOpenPriceMin > 0 ? iParams.price < order.takerOpenPriceMin : false) ||
-            (order.takerOpenPriceMax > 0 ? iParams.price > order.takerOpenPriceMax : false))
-            return (order, position, response, 3);
+        
+        (iParams.deltaAmount, iParams.orderValue, iParams.price) = getPrice(iParams.pool ,order.market, order.direction, iParams.deltaAmount, iParams.orderValue, false);
+        require((order.takerOpenPriceMin > 0 ? iParams.price >= order.takerOpenPriceMin : true) || (order.takerOpenPriceMax > 0 ? iParams.price <= order.takerOpenPriceMax : true), "MT2");
 
         response.tradeValue = iParams.marketType == 1 ? iParams.deltaAmount : iParams.orderValue;
-
         order.takerFee = iParams.orderValue.mul(iParams.marketConfig.tradeFeeRate).div(RATE_PRECISION);
         if (iParams.marketType == 2) order.takerFee = order.takerFee.mul(position.multiplier).div(RATE_PRECISION);
         order.takerFee = adjustPrecision(order.takerFee, AMOUNT_PRECISION, iParams.marketConfig.marketAssetPrecision);
-
         order.feeToInviter = order.takerFee.mul(inviteRate).div(RATE_PRECISION);
         order.feeToDiscount = order.takerFee.mul(discountRate).div(RATE_PRECISION);
-
         iParams.feeAvailable = order.takerFee.sub(order.feeToInviter).sub(order.feeToDiscount);
         order.feeToMaker = iParams.feeAvailable.mul(iParams.marketConfig.makerFeeRate).div(RATE_PRECISION);
         order.feeToExchange = iParams.feeAvailable.sub(order.feeToMaker);
 
         if (position.direction == order.direction) {
             // increase position amount
-            if (position.amount > 0) {
-                errorCode = increasePositionValidate(iParams.price, iParams.pool, iParams.marketType, iParams.marketConfig.marketAssetPrecision, position);
-                if (errorCode != 0) return (order, position, response, errorCode);
-            }
-
+            if (position.amount > 0) increasePositionValidate(iParams.price, iParams.pool, iParams.marketType, iParams.marketConfig.marketAssetPrecision, position);
+            
             position.amount = position.amount.add(iParams.deltaAmount);
             position.value = position.value.add(iParams.orderValue);
             order.rlzPnl = 0;
             order.amount = iParams.deltaAmount;
-            position.makerMargin = position.makerMargin.add(order.freezeMargin.mul(order.takerLeverage));
+            iParams.tmpMakerMargin = adjustPrecision(iParams.orderValue, AMOUNT_PRECISION, iParams.marketConfig.marketAssetPrecision);
+            position.makerMargin = position.makerMargin.add(iParams.tmpMakerMargin);
             position.takerMargin = position.takerMargin.add(order.freezeMargin.sub(order.takerFee).add(order.feeToDiscount));
             // interests global information updated before
-            position.debtShare = position.debtShare.add(IPool(iParams.pool).getCurrentShare(position.direction, order.freezeMargin.mul(order.takerLeverage)));
+            position.debtShare = position.debtShare.add(IPool(iParams.pool).getCurrentShare(position.direction, iParams.tmpMakerMargin));
 
             response.isIncreasePosition = true;
         } else {
             // decrease the position or position reversal
-            if (iParams.closeRatio == 0) {
-                iParams.closeRatio = iParams.deltaAmount.mul(AMOUNT_PRECISION).div(position.amount);
-            }
+            iParams.closeRatio = iParams.deltaAmount.mul(AMOUNT_PRECISION).div(position.amount);
 
             if (position.amount >= iParams.deltaAmount) {
                 // decrease the position, no position reversal
-
                 // split the position data according to the close ratio
                 iParams.settleTakerMargin = position.takerMargin.mul(iParams.closeRatio).div(AMOUNT_PRECISION);
                 iParams.settleMakerMargin = position.makerMargin.mul(iParams.closeRatio).div(AMOUNT_PRECISION);
@@ -204,9 +169,9 @@ contract MarketLogic is IMarketLogic {
                 iParams.toTaker = iParams.settleTakerMargin.sub(order.takerFee).toInt256().sub(order.interestPayment.toInt256()).add(order.feeToDiscount.toInt256()).add(order.rlzPnl).sub(order.fundingPayment);
 
                 // in case of bankruptcy
-                if (iParams.toTaker < 0) return (order, position, response, 10);
+                require(iParams.toTaker >= 0, "MT3");
                 // rlzPnl - fundingPayment <= maker(pool) margin
-                if (order.rlzPnl > iParams.settleMakerMargin.toInt256().add(order.fundingPayment)) return (order, position, response, 11);
+                require(order.rlzPnl <= iParams.settleMakerMargin.toInt256().add(order.fundingPayment), "MT4");
 
                 // update order and position data
                 response.toTaker = iParams.toTaker.toUint256().add(order.freezeMargin);
@@ -225,7 +190,7 @@ contract MarketLogic is IMarketLogic {
             else {
                 // position reversal, only allowed in the one-way position mode
                 // which is equivalent to two separate processes: 1. fully close the position; 2. open a new with opposite direction;
-                if (iParams.positionMode != MarketDataStructure.PositionMode.OneWay) return (order, position, response, 13);
+                require(iParams.positionMode == MarketDataStructure.PositionMode.OneWay, "MT5");
 
                 // split the order data according to the close ratio
                 iParams.settleTakerMargin = order.freezeMargin.mul(AMOUNT_PRECISION).div(iParams.closeRatio);
@@ -244,9 +209,9 @@ contract MarketLogic is IMarketLogic {
                 iParams.toTaker = position.takerMargin.toInt256().sub(position.fundingPayment).sub(iParams.feeForOriginal.toInt256()).sub(order.interestPayment.toInt256()).add(order.rlzPnl);
 
                 // in case of bankruptcy
-                if (iParams.toTaker < 0) return (order, position, response, 14);
+                require(iParams.toTaker >= 0, "MT6");
                 // rlzPnl - fundingPayment <= maker(pool) margin
-                if (order.rlzPnl > position.makerMargin.toInt256().add(position.fundingPayment)) return (order, position, response, 15);
+                require(order.rlzPnl <= position.makerMargin.toInt256().add(position.fundingPayment), "MT7");
 
                 response.toTaker = iParams.toTaker.toUint256().add(iParams.settleTakerMargin);
 
@@ -257,11 +222,12 @@ contract MarketLogic is IMarketLogic {
                 position.value = iParams.orderValue.sub(iParams.settleValue);
                 position.direction = order.direction;
                 position.takerMargin = order.freezeMargin.sub(iParams.settleTakerMargin);
-                position.makerMargin = position.takerMargin.mul(order.takerLeverage);
+                iParams.tmpMakerMargin = adjustPrecision(position.value, AMOUNT_PRECISION, iParams.marketConfig.marketAssetPrecision);
+                position.makerMargin = iParams.tmpMakerMargin;
                 position.takerMargin = position.takerMargin.sub(iParams.feeForPositionReversal);
                 position.fundingPayment = 0;
                 position.pnl = position.pnl.add(order.rlzPnl);
-                position.debtShare = IPool(iParams.pool).getCurrentShare(position.direction, position.makerMargin);
+                position.debtShare = IPool(iParams.pool).getCurrentShare(position.direction, iParams.tmpMakerMargin);
                 position.stopLossPrice = 0;
                 position.takeProfitPrice = 0;
                 position.lastTPSLTs = 0;
@@ -270,6 +236,41 @@ contract MarketLogic is IMarketLogic {
                 response.isIncreasePosition = true;
             }
         }
+        // clear dust position
+        if (position.amount < iParams.marketConfig.DUST && position.amount > 0) {
+            getPrice(iParams.pool ,order.market, position.direction.neg256().toInt8(), position.amount, 0, false);
+            
+            int256 settleDustMargin = position.takerMargin.toInt256().sub(position.fundingPayment).sub(response.leftInterestPayment.toInt256());
+            if (settleDustMargin > 0) {
+                response.toTaker = response.toTaker.add(settleDustMargin.toUint256());
+            } else {
+                order.rlzPnl = order.rlzPnl.add(settleDustMargin);
+            }
+
+            emit DustPositionClosed(
+                order.taker,
+                order.market,
+                position.id,
+                position.amount,
+                position.takerMargin,
+                position.makerMargin,
+                position.value,
+                position.fundingPayment,
+                response.leftInterestPayment
+            );
+
+            order.interestPayment = order.interestPayment.add(response.leftInterestPayment);
+            order.fundingPayment = order.fundingPayment.add(position.fundingPayment);
+
+            position.fundingPayment = 0;
+            position.takerMargin = 0;
+            position.makerMargin = 0;
+            position.debtShare = 0;
+            position.amount = 0;
+            position.value = 0;
+
+            response.isIncreasePosition = false;
+        }
 
         order.frX96 = IMarket(msg.sender).fundingGrowthGlobalX96();
         order.tradeTs = block.timestamp;
@@ -277,7 +278,7 @@ contract MarketLogic is IMarketLogic {
         order.status = MarketDataStructure.OrderStatus.Opened;
         position.lastUpdateTs = position.amount > 0 ? block.timestamp : 0;
 
-        return (order, position, response, 0);
+        return (order, position, response);
     }
 
     /// @notice calculation trading pnl using the position open value and closing order value
@@ -306,7 +307,6 @@ contract MarketLogic is IMarketLogic {
     /// @param marketType market type
     /// @param marketAssetPrecision precision of market base asset
     /// @param position position data
-    /// @return uint256 0 if validate passed non-zero error
     function increasePositionValidate(
         uint256 price,
         address pool,
@@ -315,7 +315,7 @@ contract MarketLogic is IMarketLogic {
     //    uint256 feeRate,
         uint256 marketAssetPrecision,
         MarketDataStructure.Position memory position
-    ) internal view returns (uint256){
+    ) internal view {
         uint256 closeValue;
         if (marketType == 0 || marketType == 2) {
             closeValue = position.amount.mul(price).div(PRICE_PRECISION);
@@ -335,10 +335,9 @@ contract MarketLogic is IMarketLogic {
         // ---- */
 
         // taker margin + pnl - fundingPayment - interestPayment > 0
-        if (pnl.neg256() > position.takerMargin.toInt256().sub(position.fundingPayment).sub(interestPayment.toInt256())) return 8;
+        require(pnl.neg256() <= position.takerMargin.toInt256().sub(position.fundingPayment).sub(interestPayment.toInt256()), "MI0");
         // pnl - fundingPayment < maker(pool) margin
-        if (pnl > position.makerMargin.toInt256().add(position.fundingPayment)) return 9;
-        return 0;
+        require(pnl <= position.makerMargin.toInt256().add(position.fundingPayment), "MI1");
     }
 
     struct LiquidateInfoInternalParams {
@@ -355,29 +354,31 @@ contract MarketLogic is IMarketLogic {
     /// @notice  calculate when position is liquidated, maximum profit stopped and tpsl closed by user setting
     /// @param params parameters, detailed in the data structure declaration
     /// @return response LiquidateInfoResponse
-    function getLiquidateInfo(LiquidityInfoParams memory params) public view override returns (LiquidateInfoResponse memory response) {
+    function getLiquidateInfo(LiquidityInfoParams memory params) public override onlyMarket returns (LiquidateInfoResponse memory response) {
         LiquidateInfoInternalParams memory iParams;
         iParams.marketConfig = IMarket(params.position.market).getMarketConfig();
         iParams.marketType = IMarket(params.position.market).marketType();
         iParams.pool = IMarket(params.position.market).pool();
-        response.indexPrice = getIndexPrice(params.position.market, params.position.direction == - 1);
 
         //if Liquidate,trade fee is zero
         if (params.action == MarketDataStructure.OrderType.Liquidate || params.action == MarketDataStructure.OrderType.TakeProfit) {
-            require(isLiquidateOrProfitMaximum(params.position, iParams.marketConfig.mm, response.indexPrice, iParams.marketConfig.marketAssetPrecision), "MarketLogic: position is not enough liquidity");
-            response.price = IMarketPriceFeed(marketPriceFeed).priceForLiquidate(IMarket(params.position.market).token(), params.position.direction == - 1);
+            response.indexPrice = getIndexOrMarketPrice(params.position.market, params.position.direction == - 1, true);
+            require(isLiquidateOrProfitMaximum(params.position, iParams.marketConfig.mm, response.indexPrice, iParams.marketConfig.marketAssetPrecision), "MarketLogic: position is not enough liquidate");
+            getPrice(iParams.pool, params.position.market, params.position.direction.neg256().toInt8(), params.position.amount, 0, true);
+            response.price = response.indexPrice;
         } else {
+            response.indexPrice = getIndexOrMarketPrice(params.position.market, params.position.direction == - 1, params.position.useIP);
+            (,, response.price) = getPrice(iParams.pool, params.position.market, params.position.direction.neg256().toInt8(), params.position.amount, 0, false);
             if (params.action == MarketDataStructure.OrderType.UserTakeProfit) {
                 require(params.position.takeProfitPrice > 0 && (params.position.direction == 1 ? response.indexPrice >= params.position.takeProfitPrice : response.indexPrice <= params.position.takeProfitPrice), "MarketLogic:indexPrice does not match takeProfitPrice");
             } else if (params.action == MarketDataStructure.OrderType.UserStopLoss) {
                 require(params.position.stopLossPrice > 0 && (params.position.direction == 1 ? response.indexPrice <= params.position.stopLossPrice : response.indexPrice >= params.position.stopLossPrice), "MarketLogic:indexPrice does not match stopLossPrice");
+            } else if (params.action == MarketDataStructure.OrderType.ClearAll) {
+                response.price = params.clearPrice;
             } else {
                 require(false, "MarketLogic:action error");
             }
-
-            response.price = getPrice(params.position.market, params.position.value, iParams.marketConfig.takerValueMax, params.position.direction == - 1);
         }
-
 
         (response.pnl, iParams.closeValue) = getUnPNL(params.position, response.price, iParams.marketConfig.marketAssetPrecision);
 
@@ -439,6 +440,7 @@ contract MarketLogic is IMarketLogic {
         InternalParams memory params;
         //calc position unrealized pnl
         (params.pnl, params.currentValue) = getUnPNL(position, indexPrice, toPrecision);
+        
         //calc position current payInterest
         params.payInterest = getInterestPayment(IMarket(position.market).pool(), position.direction, position.debtShare, position.makerMargin);
 
@@ -480,10 +482,10 @@ contract MarketLogic is IMarketLogic {
     function getMaxTakerDecreaseMargin(MarketDataStructure.Position memory position) external view override returns (uint256 maxDecreaseMargin) {
         MarketDataStructure.MarketConfig memory marketConfig = IMarket(position.market).getMarketConfig();
         address fundingLogic = IMarket(position.market).getLogicAddress();
-        position.frLastX96 = IFundingLogic(fundingLogic).getFunding(position.market);
+        (position.frLastX96, ) = IFundingLogic(fundingLogic).getFunding(position.market);
         position.fundingPayment = position.fundingPayment.add(IFundingLogic(fundingLogic).getFundingPayment(position.market, position.id, position.frLastX96));
         uint256 payInterest = getInterestPayment(IMarket(position.market).pool(), position.direction, position.debtShare, position.makerMargin);
-        (int256 pnl,) = getUnPNL(position, getIndexPrice(position.market, position.direction == 1), marketConfig.marketAssetPrecision);
+        (int256 pnl,) = getUnPNL(position, getIndexOrMarketPrice(position.market, position.direction == 1, true), marketConfig.marketAssetPrecision);
         uint256 minIM = adjustPrecision(position.value.mul(marketConfig.dMMultiplier).div(marketConfig.takerLeverageMax), AMOUNT_PRECISION, marketConfig.marketAssetPrecision);
         int256 profitAndFundingAndInterest = pnl.sub(payInterest.toInt256()).sub(position.fundingPayment);
         int256 maxDecreaseMarginLimit = position.takerMargin.toInt256().sub(marketConfig.takerMarginMin.toInt256());
@@ -512,6 +514,7 @@ contract MarketLogic is IMarketLogic {
         order.takerOpenPriceMax = params.maxPrice;
         order.triggerPrice = marketConfig.createTriggerOrderPaused ? 0 : params.triggerPrice;
         order.triggerDirection = marketConfig.createTriggerOrderPaused ? int8(0) : params.triggerDirection;
+        order.useIP = params.useIP;
         order.createTs = block.timestamp;
         order.mode = positionMode;
 
@@ -598,20 +601,6 @@ contract MarketLogic is IMarketLogic {
         );
     }
 
-    /// @notice validate market config params
-    /// @param market market address
-    /// @param _config market config
-    function checkoutConfig(address market, MarketDataStructure.MarketConfig memory _config) external view override {
-        uint256 marketType = IMarket(market).marketType();
-        require(_config.makerFeeRate < RATE_PRECISION, "MarketLogic:fee percent error");
-        require(_config.tradeFeeRate < RATE_PRECISION, "MarketLogic:feeRate more than one");
-        require(marketType == 2 ? _config.multiplier > 0 : true, "MarketLogic:ratio error");
-        require(_config.takerLeverageMin > 0 && _config.takerLeverageMin < _config.takerLeverageMax, "MarketLogic:leverage error");
-        require(_config.mm > 0 && _config.mm < RATE_PRECISION.div(_config.takerLeverageMax), "MarketLogic:mm error");
-        require(_config.takerMarginMin > 0 && _config.takerMarginMin < _config.takerMarginMax, "MarketLogic:margin error");
-        require(_config.takerValueMin > 0 && _config.takerValueMin < _config.takerValueMax, "MarketLogic:value error");
-    }
-
     /// @notice calculation position interest
     /// @param  pool pool address
     /// @param  direction position direction
@@ -632,16 +621,20 @@ contract MarketLogic is IMarketLogic {
     }
 
     /// @notice get trading price
-    /// @param _market market address
-    /// @param value trading value
-    /// @param maxValue trading value maximum limit in one single open order
-    /// @return price
-    function getPrice(address _market, uint256 value, uint256 maxValue, bool _maximise) public view returns (uint256){
-        return IMarketPriceFeed(marketPriceFeed).priceForTrade(IMarket(_market).token(), value, maxValue, _maximise);
+    /// @param market market address
+    /// @param takerDirection taker direction
+    /// @param deltaValue trading size
+    /// @param isLiquidation trading value 
+    /// @return size real trading size
+    /// @return vol real trading value
+    /// @return tradePrice
+    function getPrice(address pool, address market, int8 takerDirection, uint256 deltaSize, uint256 deltaValue, bool isLiquidation) internal returns (uint256 size, uint256 vol, uint256 tradePrice){
+        (size, vol, tradePrice) = IMarketPriceFeed(marketPriceFeed).priceForTrade(pool, market, IMarket(market).token(), takerDirection, deltaSize, deltaValue, isLiquidation);
     }
 
-    function getIndexPrice(address _market, bool _maximise) public view returns (uint256){
-        return IMarketPriceFeed(marketPriceFeed).priceForIndex(IMarket(_market).token(), _maximise);
+    function getIndexOrMarketPrice(address _market, bool _maximise, bool isIndexPrice) public view override returns (uint256){
+        return isIndexPrice ? IMarketPriceFeed(marketPriceFeed).priceForIndex(IMarket(_market).token(), _maximise)
+            : IMarketPriceFeed(marketPriceFeed).getMarketPrice(_market, IMarket(_market).token(), _maximise);
     }
 
     /// @notice precision conversion

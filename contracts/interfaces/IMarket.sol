@@ -35,13 +35,13 @@ interface IMarket {
 
     function cancel(uint256 _id) external;
 
-    function executeOrder(uint256 _id) external returns (int256, uint256);
+    function executeOrder(uint256 _id) external returns (int256, uint256, bool);
 
     function updateMargin(uint256 _id, uint256 _updateMargin, bool isIncrease) external;
 
-    function liquidate(uint256 _id, MarketDataStructure.OrderType action) external returns (uint256);
+    function liquidate(uint256 _id, MarketDataStructure.OrderType action, uint256 clearPrice) external returns (uint256);
 
-    function setTPSLPrice(uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice) external;
+    function setTPSLPrice(uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool isExecutedByIndexPrice) external;
 
     function takerOrderNum(address, MarketDataStructure.OrderType) external view returns (uint256);
 
@@ -52,9 +52,7 @@ interface IMarket {
     function switchPositionMode(address _taker, MarketDataStructure.PositionMode _mode) external;
 
     function orderID() external view returns (uint256);
-
-    function lastExecutedOrderId() external view returns (uint256);
-
+    
     function triggerOrderID() external view returns (uint256);
 
     function marketLogic() external view returns (address);
