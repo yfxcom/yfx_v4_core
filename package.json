@@ -1,0 +1,73 @@
+{
+  "name": "yfx-v3",
+  "version": "1.0.0",
+  "license": "MIT",
+  "engines": {
+    "node": ">=12"
+  },
+  "files": [
+    "artifacts",
+    "contracts"
+  ],
+  "devDependencies": {
+    "@nomiclabs/hardhat-ethers": "npm:hardhat-deploy-ethers@^2.0.0",
+    "@nomiclabs/hardhat-etherscan": "^3.1.0",
+    "@nomiclabs/hardhat-solhint": "^2.0.0",
+    "@nomiclabs/hardhat-waffle": "^2.0.1",
+    "@openzeppelin/contracts": "^3.4.0",
+    "@openzeppelin/contracts-upgradeable": "3.4.1-solc-0.7-2",
+    "@openzeppelin/hardhat-upgrades": "^1.7.0",
+    "@openzeppelin/test-environment": "^0.1.9",
+    "@openzeppelin/test-helpers": "^0.5.11",
+    "@rarible/royalties": "0.6.1",
+    "@rarible/royalties-upgradeable": "0.6.1",
+    "@typechain/ethers-v5": "^6.0.5",
+    "@types/chai": "^4.2.18",
+    "@types/mocha": "^8.2.2",
+    "@types/node": "^15.0.2",
+    "@uniswap/v3-core": "1.0.0",
+    "@uniswap/v3-periphery": "1.0.0",
+    "bignumber.js": "^9.0.1",
+    "bluebird": "^3.7.2",
+    "chai": "^4.3.4",
+    "ethereum-waffle": "^3.4.0",
+    "ethers": "^5.5.1",
+    "hardhat": "^2.7.0",
+    "hardhat-abi-exporter": "^2.2.1",
+    "hardhat-contract-sizer": "^2.0.3",
+    "hardhat-deploy": "^0.7.5",
+    "hardhat-docgen": "^1.1.1",
+    "hardhat-gas-reporter": "^1.0.4",
+    "hardhat-typechain": "^0.3.5",
+    "hardhat-watcher": "^2.1.1",
+    "mocha": "^8.4.0",
+    "prettier": "^2.2.1",
+    "prettier-plugin-solidity": "^1.0.0-beta.10",
+    "rimraf": "^3.0.2",
+    "solhint": "^3.3.4",
+    "solidity-coverage": "^0.7.16",
+    "truffle-hdwallet-provider": "^1.0.17",
+    "ts-generator": "^0.1.1",
+    "ts-node": "^10.8.1",
+    "typechain": "^4.0.3",
+    "typescript": "^4.2.4"
+  },
+  "scripts": {
+    "lint": "yarn prettier --check ./contracts  ./*.ts",
+    "lint:fix": "yarn prettier --write ./contracts ./*.ts",
+    "deploy:contracts": "npx hardhat run scripts/deploy.ts",
+    "precompile": "rimraf ./artifacts/ ./cache/",
+    "prebuild": "rimraf ./typechain/ ",
+    "build": "yarn compile",
+    "compile": "npx hardhat compile --config hardhat.config.ts  --show-stack-traces",
+    "pretest": "yarn compile",
+    "test": "npx hardhat test",
+    "deploy:bsct": "npx hardhat run --network bsct scripts/deploy.ts",
+    "deploy:bsc": "npx hardhat run --network bsc scripts/deploy.ts"
+  },
+  "dependencies": {
+    "@chainlink/contracts": "^0.4.0",
+    "dotenv": "^16.0.3",
+    "fs": "^0.0.1-security"
+  }
+}
