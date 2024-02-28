@@ -229,7 +229,7 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice execute order
     /// @param _market market contract address
     /// @param _orderId order id
-    function executeOrder(address _market, uint256 _orderId) external nonReentrant validateMarket(_market) {
+    function executeOrder(address _market, uint256 _orderId) external payable nonReentrant validateMarket(_market) {
         MarketDataStructure.Order memory order = IMarket(_market).getOrder(_orderId);
         require(_shouldExecute(msg.sender, order.createTs), "REO0");
 
@@ -247,14 +247,14 @@ contract Router is ReentrancyGuard, Multicall {
     }
 
     /// @notice execute position liquidation, take profit and tpsl
-    function executePositionTrigger(address _market, uint256 id, MarketDataStructure.OrderType action) external nonReentrant onlyPriceProvider {
+    function executePositionTrigger(address _market, uint256 id, MarketDataStructure.OrderType action) external payable nonReentrant onlyPriceProvider {
         _liquidate(msg.sender, _market, id, action, 0);
     }
 
     /// @notice execute position liquidation, take profit and tpsl
     /// @param _market  market contract address
     /// @param id   position id
-    function liquidate(address _market, uint256 id) external nonReentrant {
+    function liquidate(address _market, uint256 id) external payable nonReentrant {
         _liquidate(msg.sender, _market, id, MarketDataStructure.OrderType.Liquidate, 0);
     }
 
@@ -406,6 +406,7 @@ contract Router is ReentrancyGuard, Multicall {
     /// @param _deadline deadline
     function createPoolOrder(IOrder.CreateOrderParams memory _params, uint256 _deadline) external payable ensure(_deadline) validatePool(_params.pool) {
         uint256 fee = getExecuteOrderFee();
+        _params.executeFee = fee;
         if (_params.orderType == IOrder.PoolOrderType.Increase) {
             address baseAsset = IPool(_params.pool).getBaseAsset();
             bool isETH = baseAsset == WETH && msg.value > fee;
@@ -437,7 +438,7 @@ contract Router is ReentrancyGuard, Multicall {
 
     /// @notice execute pool order
     /// @param _orderId order id
-    function executePoolOrder(uint256 _orderId) external onlyPriceProvider returns (bool isSuccess) {
+    function executePoolOrder(uint256 _orderId) external payable onlyPriceProvider returns (bool isSuccess) {
         IOrder.PoolOrder memory order = IOrder(poolOrder).getPoolOrder(_orderId);
         require(order.status == IOrder.PoolOrderStatus.Submit && order.id > 0, "MEPO0");
         isSuccess = order.orderType == IOrder.PoolOrderType.Increase ? _addLiquidity(order) :
@@ -449,7 +450,7 @@ contract Router is ReentrancyGuard, Multicall {
     /// @param _pool pool address
     /// @param _maker maker address
     /// @param isReceiveETH whether receive ETH
-    function removeLiquidityBySystem(address _pool, address _maker, bool isReceiveETH) external onlyPriceProvider {
+    function removeLiquidityBySystem(address _pool, address _maker, bool isReceiveETH) external payable onlyPriceProvider {
         _removeLiquidity(0, _pool, _maker, type(uint256).max, true, isReceiveETH, true);
     }
 
@@ -510,7 +511,7 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice liquidate the liquidity position
     /// @param _pool pool address
     /// @param _positionId position id
-    function liquidateLiquidityPosition(address _pool, uint256 _positionId) external {
+    function liquidateLiquidityPosition(address _pool, uint256 _positionId) external payable{
         _liquidateLiquidityPosition(_pool, _positionId);
         IRiskFunding(riskFunding).updateLiquidatorExecutedFee(msg.sender);
     }
@@ -518,7 +519,7 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice clear the maker position
     /// @param _pool pool address
     /// @param _positionId position id
-    function clearMakerPosition(address _pool, uint256 _positionId) external onlyPriceProvider {
+    function clearMakerPosition(address _pool, uint256 _positionId) external payable onlyPriceProvider {
         _liquidateLiquidityPosition(_pool, _positionId);
     }
 

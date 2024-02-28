@@ -100,7 +100,7 @@ contract Order is IOrder {
             }
         }
         EnumerableSet.remove(notExecuteOrderIds[order.maker][order.pool], order.id);
-        emit UpdatePoolOrder(order.pool, order.maker, order.id, status);
+        emit UpdatePoolOrder(order.maker, order.pool, order.id, status);
     }
 
     function getPoolOrder(uint256 _orderId) external view override returns (PoolOrder memory) {
