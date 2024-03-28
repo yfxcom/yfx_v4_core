@@ -9,21 +9,18 @@ import "../libraries/TransferHelper.sol";
 import "../libraries/SafeCast.sol";
 import "../libraries/SignedSafeMath.sol";
 import "../libraries/ReentrancyGuard.sol";
-import "../libraries/Multicall.sol";
 import "../interfaces/IManager.sol";
 import "../interfaces/IERC20.sol";
 import "../interfaces/IWrappedCoin.sol";
 import "../interfaces/IMarket.sol";
-import "../interfaces/IRiskFunding.sol";
 import "../interfaces/IPool.sol";
 import "../interfaces/IFundingLogic.sol";
-import "../interfaces/IFastPriceFeed.sol";
 import "../interfaces/IInviteManager.sol";
 import "../interfaces/IMarketLogic.sol";
 import "../interfaces/IRewardRouter.sol";
 import "../interfaces/IOrder.sol";
 
-contract Router is ReentrancyGuard, Multicall {
+contract Router is ReentrancyGuard {
     using SafeMath for uint256;
     using SafeMath for uint32;
     using SignedSafeMath for int256;
@@ -32,11 +29,8 @@ contract Router is ReentrancyGuard, Multicall {
     using EnumerableSet for EnumerableSet.UintSet;
 
     address public manager;
-    address fastPriceFeed;
-    address riskFunding;
     address inviteManager;
     address marketLogic;
-    address rewardRouter;
     address poolOrder;
 
     //taker => market => orderId[]
@@ -45,29 +39,10 @@ contract Router is ReentrancyGuard, Multicall {
 
 
     event OrderCreated(address market, uint256 id);
-    event OrderExecuted(address executer, address market, uint256 id, uint256 orderid);
-    event Liquidate(address market, uint256 id, uint256 orderid, address liquidator);
-    event TakeProfit(address market, uint256 id, uint256 orderid);
     event Cancel(address market, uint256 id);
-    event ChangeStatus(address market, uint256 id);
-    event AddLiquidity(uint256 id, address pool, uint256 amount);
-    event RemoveLiquidity(uint256 id, address pool, uint256 liquidity);
-    event ExecuteAddLiquidityOrder(uint256 id, address pool);
-    event ExecuteRmLiquidityOrder(uint256 id, address pool);
     event SetStopProfitAndLossPrice(uint256 id, address market, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice);
-    event SetParams(address _fastPriceFeed, address _riskFunding, address _inviteManager, address _marketLogic, address _rewardRouter, address _order);
-    event CloseTakerPositionWithClearPrice(address market, uint256 id, uint256 orderid, uint256 cleearPrice);
+    event SetParams(address _inviteManager, address _marketLogic, address _order);
     event SetMakerTPSLPrice(address pool, uint256 positionId, uint256 profitPrice, uint256 stopLossPrice);
-    event UnstakeLpForAccountError(string error);
-    event UnstakeLpForAccountLowLevelError(bytes error);
-    event StakeLpForAccountError(string error);
-    event StakeLpForAccountLowLevelError(bytes error);
-    event ModifyStakeAmountError(string error);
-    event ModifyStakeAmountLowLevelError(bytes error);
-    event AddLiquidityError(string error);
-    event AddLiquidityLowLevelError(bytes error);
-    event RemoveLiquidityError(string error);
-    event RemoveLiquidityLowLevelError(bytes error);
 
     constructor(address _manager, address _WETH) {
         manager = _manager;
@@ -89,11 +64,6 @@ contract Router is ReentrancyGuard, Multicall {
         _;
     }
 
-    modifier onlyPriceProvider() {
-        require(IManager(manager).checkSigner(msg.sender), "ROP0");
-        _;
-    }
-
     modifier ensure(uint256 deadline) {
         require(deadline >= block.timestamp, 'RE0');
         _;
@@ -110,19 +80,15 @@ contract Router is ReentrancyGuard, Multicall {
     }
 
     /// @notice set params, only controller can call
-    /// @param _fastPriceFeed fast price feed contract address
-    /// @param _riskFunding risk funding contract address
     /// @param _inviteManager invite manager contract address
     /// @param _marketLogic market logic contract address
-    function setConfigParams(address _fastPriceFeed, address _riskFunding, address _inviteManager, address _marketLogic, address _rewardRouter, address _order) external onlyController {
-        require(_fastPriceFeed != address(0) && _riskFunding != address(0) && _inviteManager != address(0) && _marketLogic != address(0) && _order != address(0), "RSC0");
-        fastPriceFeed = _fastPriceFeed;
-        riskFunding = _riskFunding;
+    /// @param _order order address
+    function setConfigParams(address _inviteManager, address _marketLogic, address _order) external onlyController {
+        require(_inviteManager != address(0) && _marketLogic != address(0) && _order != address(0), "RSC0");
         inviteManager = _inviteManager;
         marketLogic = _marketLogic;
-        rewardRouter = _rewardRouter;
         poolOrder = _order;
-        emit SetParams(_fastPriceFeed, _riskFunding, _inviteManager, _marketLogic, _rewardRouter, _order);
+        emit SetParams(_inviteManager, _marketLogic, _order);
     }
 
     /// @notice user open position parameters
@@ -154,10 +120,14 @@ contract Router is ReentrancyGuard, Multicall {
         uint256 deadline;
     }
 
-    /// @notice place an open-position order, margined by erc20 tokens
+    /// @notice place an open-position order, margined by both erc20 and eth
     /// @param params order params, detailed in the data structure declaration
     /// @return id order id
-    function takerOpen(TakerOpenParams memory params) external payable ensure(params.deadline) validateMarket(params._market) returns (uint256 id) {
+    function takerOpen(TakerOpenParams memory params) external payable ensure(params.deadline) validateMarket(params._market) whenNotPaused nonReentrant returns (uint256 id) {
+        require(params.minPrice <= params.maxPrice, "RTOP0");
+
+        setReferralCode(params.inviterCode);
+
         address marginAsset = getMarketMarginAsset(params._market);
         uint256 fee = getExecuteOrderFee();
         bool isETH = marginAsset == WETH && msg.value > fee;
@@ -167,14 +137,8 @@ contract Router is ReentrancyGuard, Multicall {
             require(msg.value == fee, "RTOE2");
         }
         require(params.margin > 0, "RTOE1");
-        _transferMargin(marginAsset, params._market, params.margin, isETH);
-        id = _takerOpen(params, isETH);
-    }
 
-    function _takerOpen(TakerOpenParams memory params, bool isETH) internal whenNotPaused returns (uint256 id) {
-        require(params.minPrice <= params.maxPrice, "RTOP0");
-
-        setReferralCode(params.inviterCode);
+        _transfer(marginAsset, params._market, params.margin, isETH);
 
         id = IMarket(params._market).createOrder(MarketDataStructure.CreateInternalParams({
             _taker: msg.sender,
@@ -192,6 +156,7 @@ contract Router is ReentrancyGuard, Multicall {
             isLiquidate: false,
             isETH: isETH
         }));
+
         EnumerableSet.add(notExecuteOrderIds[msg.sender][params._market], id);
         emit OrderCreated(params._market, id);
     }
@@ -199,7 +164,7 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice place a close-position order
     /// @param params order parameters, detailed in the data structure declaration
     /// @return id order id
-    function takerClose(TakerCloseParams memory params) external payable ensure(params.deadline) validateMarket(params._market) whenNotPaused returns (uint256 id){
+    function takerClose(TakerCloseParams memory params) external payable ensure(params.deadline) validateMarket(params._market) whenNotPaused nonReentrant returns (uint256 id){
         require(params.minPrice <= params.maxPrice, "RTCL0");
         uint256 executeOrderFee = getExecuteOrderFee();
         require(msg.value == executeOrderFee, "RTCL1");
@@ -222,85 +187,28 @@ contract Router is ReentrancyGuard, Multicall {
             isLiquidate: false,
             isETH: false
         }));
+
         EnumerableSet.add(notExecuteOrderIds[msg.sender][params._market], id);
         emit OrderCreated(params._market, id);
-    }
-
-    /// @notice execute order
-    /// @param _market market contract address
-    /// @param _orderId order id
-    function executeOrder(address _market, uint256 _orderId) external payable nonReentrant validateMarket(_market) {
-        MarketDataStructure.Order memory order = IMarket(_market).getOrder(_orderId);
-        require(_shouldExecute(msg.sender, order.createTs), "REO0");
-
-        if (order.id != 0 && order.status == MarketDataStructure.OrderStatus.Open) {
-            (int256 resultCode,uint256 positionId, bool isAllClosed) = IMarket(_market).executeOrder(_orderId);
-            if (resultCode == 0) {
-                EnumerableSet.remove(notExecuteOrderIds[order.taker][order.market], order.id);
-                _modifyStakeAmount(order.market, order.taker, isAllClosed);
-            }
-            if (resultCode == 0 || resultCode == 1) {
-                TransferHelper.safeTransferETH(msg.sender, order.executeFee);
-            }
-            emit OrderExecuted(msg.sender, order.market, positionId, order.id);
-        }
-    }
-
-    /// @notice execute position liquidation, take profit and tpsl
-    function executePositionTrigger(address _market, uint256 id, MarketDataStructure.OrderType action) external payable nonReentrant onlyPriceProvider {
-        _liquidate(msg.sender, _market, id, action, 0);
-    }
-
-    /// @notice execute position liquidation, take profit and tpsl
-    /// @param _market  market contract address
-    /// @param id   position id
-    function liquidate(address _market, uint256 id) external payable nonReentrant {
-        _liquidate(msg.sender, _market, id, MarketDataStructure.OrderType.Liquidate, 0);
-    }
-
-    function closeTakerPositionWithClearPrice(address _pool, address _market, uint256 _positionId, uint256 _clearPrice) external nonReentrant onlyPriceProvider {
-        require(IPool(_pool).clearAll(), "RCTP0");
-        _liquidate(msg.sender, _market, _positionId, MarketDataStructure.OrderType.ClearAll, _clearPrice);
-    }
-
-    function _liquidate(address _caller, address _market, uint256 id, MarketDataStructure.OrderType action, uint256 _clearPrice) internal validateMarket(_market) {
-        MarketDataStructure.Position memory position = IMarket(_market).getPosition(id);
-        uint256 orderId = IMarket(_market).liquidate(id, action, _clearPrice);
-        if (MarketDataStructure.OrderType.Liquidate == action) {
-            IRiskFunding(riskFunding).updateLiquidatorExecutedFee(_caller);
-        }
-
-        _modifyStakeAmount(_market, position.taker, true);
-
-        emit Liquidate(_market, id, orderId, _caller);
     }
 
     /// @notice  add margin to a position, margined by ERC20 tokens
     /// @param _market  market contract address
     /// @param _id  position id
-    /// @param _value  add margin value
-    function increaseMargin(address _market, uint256 _id, uint256 _value) external payable validateMarket(_market) {
+    /// @param _value  add margin value 
+    function increaseMargin(address _market, uint256 _id, uint256 _value) external payable nonReentrant {
         address marginAsset = getMarketMarginAsset(_market);
         bool isETH = marginAsset == WETH && msg.value > 0;
         _value = isETH ? msg.value : _value;
-        _transferMargin(marginAsset, IManager(manager).vault(), _value, isETH);
+        _transfer(marginAsset, IManager(manager).vault(), _value, isETH);
         _updateMargin(_market, _id, _value, true);
-    }
-
-    function _transferMargin(address asset, address to, uint256 amount, bool isETH) internal {
-        if (isETH) {
-            IWrappedCoin(WETH).deposit{value: amount}();
-            TransferHelper.safeTransfer(WETH, to, amount);
-        } else {
-            TransferHelper.safeTransferFrom(asset, msg.sender, to, amount);
-        }
     }
 
     /// @notice  remove margin from a position
     /// @param _market  market contract address
     /// @param _id  position id
     /// @param _value  remove margin value
-    function decreaseMargin(address _market, uint256 _id, uint256 _value) external validateMarket(_market) {
+    function decreaseMargin(address _market, uint256 _id, uint256 _value) external nonReentrant {
         _updateMargin(_market, _id, _value, false);
     }
 
@@ -325,16 +233,10 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice user or system cancel an order that open or failed
     /// @param _market market address
     /// @param id order id
-    function orderCancel(address _market, uint256 id) external validateMarket(_market) {
+    function orderCancel(address _market, uint256 id) external validateMarket(_market) nonReentrant {
         address marginAsset = getMarketMarginAsset(_market);
         MarketDataStructure.Order memory order = IMarket(_market).getOrder(id);
-        if (!IManager(manager).checkSigner(msg.sender)) {
-            require(
-                order.taker == msg.sender
-                && order.createTs.add(IManager(manager).cancelElapse()) <= block.timestamp,
-                "MORC0"
-            );
-        }
+        require(order.taker == msg.sender && order.createTs.add(IManager(manager).cancelElapse()) <= block.timestamp, "MORC0");
 
         IMarket(_market).cancel(id);
         if (order.freezeMargin > 0) {
@@ -346,8 +248,8 @@ contract Router is ReentrancyGuard, Multicall {
             }
         }
 
-        if (order.status == MarketDataStructure.OrderStatus.Open)
-            TransferHelper.safeTransferETH(order.taker, order.executeFee);
+        if (order.status == MarketDataStructure.OrderStatus.Open) TransferHelper.safeTransferETH(order.taker, order.executeFee);
+
         EnumerableSet.remove(notExecuteOrderIds[order.taker][_market], id);
         emit Cancel(_market, id);
     }
@@ -357,13 +259,9 @@ contract Router is ReentrancyGuard, Multicall {
     /// @param _id  position id
     /// @param _profitPrice take-profit price
     /// @param _stopLossPrice stop-loss price
-    function setTPSLPrice(address _market, uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice) external payable validateMarket(_market) whenNotPaused {
+    function setTPSLPrice(address _market, uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice) external whenNotPaused {
         MarketDataStructure.Position memory position = IMarket(_market).getPosition(_id);
-        require(
-            position.taker == msg.sender
-            && position.amount > 0,
-            "MSTP0"
-        );
+        require(position.taker == msg.sender && position.amount > 0, "MSTP0");
         IMarket(_market).setTPSLPrice(_id, _profitPrice, _stopLossPrice, _isExecutedByIndexPrice);
         emit SetStopProfitAndLossPrice(_id, _market, _profitPrice, _stopLossPrice, _isExecutedByIndexPrice);
     }
@@ -371,61 +269,37 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice user modify position mode
     /// @param _market  market contract address
     /// @param _mode  position mode
-    function switchPositionMode(address _market, MarketDataStructure.PositionMode _mode) external validateMarket(_market) {
+    function switchPositionMode(address _market, MarketDataStructure.PositionMode _mode) external {
         IMarketLogic(IMarket(_market).marketLogic()).checkSwitchMode(_market, msg.sender, _mode);
         IMarket(_market).switchPositionMode(msg.sender, _mode);
-    }
-
-    /// @notice update offChain price by price provider
-    /// @param backupPrices  backup price array
-    /// @param primaryPrices primary price array
-    function setPrices(bytes memory backupPrices, bytes memory primaryPrices) public payable onlyPriceProvider {
-        IFastPriceFeed(fastPriceFeed).setPrices{value: msg.value}(backupPrices, primaryPrices);
-    }
-
-    function _shouldExecute(address _caller, uint256 _createTs) internal view returns (bool){
-        if (IManager(manager).checkSigner(_caller)) return true;
-        if (_createTs.add(IManager(manager).communityExecuteOrderDelay()) > block.timestamp) return true;
-        return false;
-    }
-    
-    function _modifyStakeAmount(address market, address taker, bool isAllClose) internal {
-        if (rewardRouter != address(0)) {
-            try IRewardRouter(rewardRouter).modifyStakedPosition(market, taker, isAllClose){}
-            catch Error(string memory reason){
-                emit ModifyStakeAmountError(reason);
-            }
-            catch (bytes memory error){
-                emit ModifyStakeAmountLowLevelError(error);
-            }
-        }
     }
 
     /// @notice create pool order
     /// @param _params order params
     /// @param _deadline deadline
-    function createPoolOrder(IOrder.CreateOrderParams memory _params, uint256 _deadline) external payable ensure(_deadline) validatePool(_params.pool) {
+    function createPoolOrder(IOrder.CreateOrderParams memory _params, uint256 _deadline) external payable nonReentrant ensure(_deadline) validatePool(_params.pool) {
         uint256 fee = getExecuteOrderFee();
         _params.executeFee = fee;
+        _params.maker = msg.sender;
         if (_params.orderType == IOrder.PoolOrderType.Increase) {
             address baseAsset = IPool(_params.pool).getBaseAsset();
             bool isETH = baseAsset == WETH && msg.value > fee;
             if (isETH) {
                 _params.margin = msg.value.sub(fee);
-                require(_params.margin > 0, "MCRP0");
             } else {
                 require(msg.value == fee, "MCRP1");
             }
-            _transferMargin(baseAsset, poolOrder, _params.margin, isETH);
+            _transfer(baseAsset, poolOrder, _params.margin, isETH);
         } else {
             require(msg.value == fee, "MCRP2");
         }
+
         IOrder(poolOrder).createOrder(_params);
     }
 
     /// @notice cancel pool order
     //// @param _orderId order id
-    function cancelPoolOrder(uint256 _orderId) external {
+    function cancelPoolOrder(uint256 _orderId) external nonReentrant {
         IOrder.PoolOrder memory order = IOrder(poolOrder).getPoolOrder(_orderId);
         require(
             order.maker == msg.sender
@@ -433,69 +307,8 @@ contract Router is ReentrancyGuard, Multicall {
             && order.createTs.add(uint32(IManager(manager).cancelElapse())) <= block.timestamp,
             "MCPO0"
         );
-        _updatePoolOrderStatus(order, IOrder.PoolOrderStatus.Cancel);
-    }
-
-    /// @notice execute pool order
-    /// @param _orderId order id
-    function executePoolOrder(uint256 _orderId) external payable onlyPriceProvider returns (bool isSuccess) {
-        IOrder.PoolOrder memory order = IOrder(poolOrder).getPoolOrder(_orderId);
-        require(order.status == IOrder.PoolOrderStatus.Submit && order.id > 0, "MEPO0");
-        isSuccess = order.orderType == IOrder.PoolOrderType.Increase ? _addLiquidity(order) :
-            _removeLiquidity(order.id, order.pool, order.maker, order.liquidity, order.isUnStakeLp, order.isETH, false);
-        _updatePoolOrderStatus(order, isSuccess ? IOrder.PoolOrderStatus.Success : IOrder.PoolOrderStatus.Fail);
-    }
-
-    /// @notice remove liquidity by system ,tp/sl
-    /// @param _pool pool address
-    /// @param _maker maker address
-    /// @param isReceiveETH whether receive ETH
-    function removeLiquidityBySystem(address _pool, address _maker, bool isReceiveETH) external payable onlyPriceProvider {
-        _removeLiquidity(0, _pool, _maker, type(uint256).max, true, isReceiveETH, true);
-    }
-
-    function _addLiquidity(IOrder.PoolOrder memory order) internal returns (bool isAddSuccess){
-        try IPool(order.pool).addLiquidity(order.id, order.maker, order.margin, order.leverage) returns (uint256 liquidity){
-            isAddSuccess = true;
-            if (order.isStakeLp && rewardRouter != address(0)) {
-                try IRewardRouter(rewardRouter).stakeLpForAccount(order.maker, order.pool, liquidity){}
-                catch Error(string memory reason){
-                    emit StakeLpForAccountError(reason);
-                }
-                catch (bytes memory error){
-                    emit StakeLpForAccountLowLevelError(error);
-                }
-            }
-        }
-        catch Error(string memory reason){
-            isAddSuccess = false;
-            emit AddLiquidityError(reason);
-        }
-        catch (bytes memory error){
-            isAddSuccess = false;
-            emit AddLiquidityLowLevelError(error);
-        }
-    }
-
-    function _removeLiquidity(uint256 _orderId, address _pool, address _maker, uint256 _liquidity, bool _isUnStake, bool _isReceiveETH, bool _isSystem) internal returns (bool isRemoveSuccess){
-        _preRemoveLiquidity(_maker, _pool, _liquidity, _isUnStake, false);
-        try IPool(_pool).removeLiquidity(_orderId, _maker, _liquidity, IPool(_pool).getBaseAsset() == WETH ? _isReceiveETH : false, _isSystem){
-            isRemoveSuccess = true;
-        }
-        catch Error(string memory reason){
-            isRemoveSuccess = false;
-            emit RemoveLiquidityError(reason);
-        }
-        catch (bytes memory error){
-            isRemoveSuccess = false;
-            emit RemoveLiquidityLowLevelError(error);
-        }
-    }
-
-    function _updatePoolOrderStatus(IOrder.PoolOrder memory order, IOrder.PoolOrderStatus status) internal {
-        // refund or send execute fee
-        TransferHelper.safeTransferETH(status == IOrder.PoolOrderStatus.Success ? msg.sender : order.maker, order.executeFee);
-        IOrder(poolOrder).updatePoolOrder(order.id, status);
+        TransferHelper.safeTransferETH(order.maker, order.executeFee);
+        IOrder(poolOrder).updatePoolOrder(order.id, IOrder.PoolOrderStatus.Cancel);
     }
 
     /// @notice set the take-profit and stop-loss price for a maker position
@@ -503,57 +316,30 @@ contract Router is ReentrancyGuard, Multicall {
     /// @param _positionId position id
     /// @param _profitPrice take-profit price
     /// @param _stopLossPrice stop-loss price
-    function setMakerTPSLPrice(address _pool, uint256 _positionId, uint256 _profitPrice, uint256 _stopLossPrice) external payable validatePool(_pool) {
+    function setMakerTPSLPrice(address _pool, uint256 _positionId, uint256 _profitPrice, uint256 _stopLossPrice) external {
         IPool(_pool).setTPSLPrice(msg.sender, _positionId, _profitPrice, _stopLossPrice);
         emit SetMakerTPSLPrice(_pool, _positionId, _profitPrice, _stopLossPrice);
-    }
-
-    /// @notice liquidate the liquidity position
-    /// @param _pool pool address
-    /// @param _positionId position id
-    function liquidateLiquidityPosition(address _pool, uint256 _positionId) external payable{
-        _liquidateLiquidityPosition(_pool, _positionId);
-        IRiskFunding(riskFunding).updateLiquidatorExecutedFee(msg.sender);
-    }
-
-    /// @notice clear the maker position
-    /// @param _pool pool address
-    /// @param _positionId position id
-    function clearMakerPosition(address _pool, uint256 _positionId) external payable onlyPriceProvider {
-        _liquidateLiquidityPosition(_pool, _positionId);
-    }
-
-    function _liquidateLiquidityPosition(address _pool, uint256 _positionId) internal {
-        IPool.Position memory position = IPool(_pool).makerPositions(_positionId);
-        _preRemoveLiquidity(position.maker, _pool, position.liquidity, true, true);
-        IPool(_pool).liquidate(_positionId);
-    }
-
-    function _preRemoveLiquidity(address sender, address _pool, uint256 _liquidity, bool isUnStake, bool isLiquidate) internal {
-        if (isUnStake && rewardRouter != address(0)) {
-            uint256 lpBalance = IERC20(_pool).balanceOf(sender);
-            if (lpBalance < _liquidity) {
-                try IRewardRouter(rewardRouter).unstakeLpForAccount(sender, _pool, _liquidity.sub(lpBalance), isLiquidate) {}
-                catch Error(string memory reason){
-                    emit UnstakeLpForAccountError(reason);
-                }
-                catch (bytes memory error){
-                    emit UnstakeLpForAccountLowLevelError(error);
-                }
-            }
-        }
     }
 
     /// @notice add margin to a maker position
     /// @param pool pool address
     /// @param positionId position id
     /// @param addMargin add margin value
-    function addMakerPositionMargin(address pool, uint256 positionId, uint256 addMargin) external payable validatePool(pool) {
+    function addMakerPositionMargin(address pool, uint256 positionId, uint256 addMargin) external payable validatePool(pool) nonReentrant {
         address baseAsset = IPool(pool).getBaseAsset();
         bool isETH = baseAsset == WETH && msg.value > 0;
         addMargin = isETH ? msg.value : addMargin;
-        _transferMargin(baseAsset, IManager(manager).vault(), addMargin, isETH);
+        _transfer(baseAsset, IManager(manager).vault(), addMargin, isETH);
         IPool(pool).addMakerPositionMargin(positionId, addMargin);
+    }
+
+    function _transfer(address asset, address to, uint256 amount, bool isETH) internal {
+        if (isETH) {
+            IWrappedCoin(WETH).deposit{value: amount}();
+            TransferHelper.safeTransfer(WETH, to, amount);
+        } else {
+            TransferHelper.safeTransferFrom(asset, msg.sender, to, amount);
+        }
     }
 
     /// @notice set the referral code for the trader
@@ -587,6 +373,18 @@ contract Router is ReentrancyGuard, Multicall {
     /// @notice transfer the execution fee to the update router by the treasurer
     function withdrawExecuteFee() external onlyTreasurer {
         TransferHelper.safeTransferETH(IManager(manager).router(), address(this).balance);
+    }
+
+    function executorTransfer(address to, uint256 amount) external {
+        IManager(manager).checkExecutorRouter(msg.sender);
+
+        TransferHelper.safeTransferETH(to, amount);
+    }
+
+    function removeNotExecuteOrderId(address taker, address market, uint256 orderId) external {
+        IManager(manager).checkExecutorRouter(msg.sender);
+        
+        EnumerableSet.remove(notExecuteOrderIds[taker][market], orderId);
     }
 
     receive() external payable {

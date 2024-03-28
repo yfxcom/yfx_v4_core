@@ -58,6 +58,11 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
         _;
     }
 
+    modifier _onlyExecutor(){
+        require(IManager(manager).checkExecutorRouter(msg.sender), 'PME');
+        _;
+    }
+
     modifier whenNotAddPaused() {
         require(!IManager(manager).paused() && !addPaused, "PMW");
         _;
@@ -214,7 +219,7 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
         address sender,
         uint256 amount,
         uint256 leverage
-    ) external nonReentrant _onlyRouter whenNotAddPaused returns (uint256 liquidity){
+    ) external nonReentrant _onlyExecutor whenNotAddPaused returns (uint256 liquidity){
         require(
             !clearAll
             && amount >= minAddLiquidityAmount
@@ -261,6 +266,7 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
         uint256 removeRate;
         uint256 settleEntryValue;
         uint256 settleInitMargin;
+        uint256 remainLiquidity;
         uint256 outVol;
         uint256 feeToPool;
         int256 pnl;
@@ -277,16 +283,21 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
         uint256 liquidity,
         bool isETH,
         bool isSystem
-    ) external nonReentrant _onlyRouter whenNotRemovePaused returns (uint256 settleLiquidity){
-        require(!clearAll && liquidity >= minRemoveLiquidityAmount, "PRL0");
+    ) external nonReentrant _onlyExecutor whenNotRemovePaused returns (uint256 settleLiquidity){
+        require(!clearAll, "PRL0"); 
         RemoveLiquidityVars memory vars;
         vars.positionId = makerPositionIds[sender];
+        require(vars.positionId > 0, "PRL1");
         GlobalHf memory g = _globalInfo(false);
         IPool.Position storage position = makerPositions[vars.positionId];
-        require(position.liquidity > 0, "PRL2");
         _updateBorrowIG(g.allMarketPos.longMakerFreeze, g.allMarketPos.shortMakerFreeze);
         _checkPoolPnlStatus(g);
         settleLiquidity = position.liquidity >= liquidity ? liquidity : position.liquidity;
+        vars.remainLiquidity = position.liquidity.sub(settleLiquidity);
+        if (vars.remainLiquidity <= minRemoveLiquidityAmount) {
+            settleLiquidity = position.liquidity;
+        }
+        
         vars.removeRate = settleLiquidity.mul(1e18).div(position.liquidity);
         require(balanceOf[sender] >= settleLiquidity, "PRL3");
         vars.settleEntryValue = position.entryValue.mul(vars.removeRate).div(1e18);
@@ -302,7 +313,7 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
         require(balance >= vars.outVol.toInt256(), 'PRL6');
         vars.pnl = vars.outVol.toInt256().sub(vars.settleEntryValue.toInt256());
         vars.outAmount = vars.settleInitMargin.toInt256().add(vars.pnl);
-        require(vars.outAmount > 0, "PRL7");
+        require(vars.outAmount >= 0, "PRL7");
 
         _burn(sender, settleLiquidity);
         balanceReal = balanceReal.sub(vars.outAmount);
@@ -336,7 +347,7 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
 
     /// @notice if position state is liquidation, the position will be liquidated
     /// @param positionId liquidity position id
-    function liquidate(uint256 positionId) external nonReentrant _onlyRouter whenNotRemovePaused {
+    function liquidate(uint256 positionId) external nonReentrant _onlyExecutor whenNotRemovePaused {
         LiquidateVars memory vars;
         IPool.Position storage position = makerPositions[positionId];
         require(position.liquidity > 0, "PL0");
@@ -499,7 +510,7 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
     function _globalHf(bool isAdd) internal view returns (GlobalHf memory g, bool status){
         g = _globalInfo(isAdd);
         int256 tempTotalLockedFund = balanceReal.add(g.allMarketPos.takerTotalMargin.toInt256());
-        int256 totalAvailableFund = balanceReal.add(g.poolInterest.toInt256()).add(g.totalUnPNL).add(g.allMarketPos.makerFundingPayment) - g.poolTotalTmp.mul(mm).div(RATE_PRECISION).toInt256();
+        int256 totalAvailableFund = balanceReal.add(g.poolInterest.toInt256()).add(g.totalUnPNL).add(g.allMarketPos.makerFundingPayment).sub(g.poolTotalTmp.mul(mm).div(RATE_PRECISION).toInt256());
         totalAvailableFund = totalAvailableFund > tempTotalLockedFund? tempTotalLockedFund : totalAvailableFund;
         status = totalAvailableFund < 0;
     }

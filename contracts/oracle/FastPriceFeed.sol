@@ -5,12 +5,14 @@ pragma abicoder v2;
 import "../libraries/PythStructs.sol";
 import "../libraries/SafeMath.sol";
 import "../libraries/Common.sol";
+import "../libraries/TransferHelper.sol";
 import "../interfaces/IManager.sol";
 import "../interfaces/IMarketPriceFeed.sol";
 import "../interfaces/IFeeManager.sol";
 import "../interfaces/IVerifierProxy.sol";
 import "../interfaces/IFastPriceFeed.sol";
 import "../interfaces/IPyth.sol";
+import "../interfaces/IWrappedCoin.sol";
 
 contract FastPriceFeed {
     using SafeMath for uint256;
@@ -64,6 +66,7 @@ contract FastPriceFeed {
     bool public isSpreadEnabled = false;//is spread enabled
     address public manager;
 
+    address public WETH;
     IVerifierProxy public verifier;
     IPyth public pyth;
     uint256 public maxPriceTsDiff;//max price timestamp diff
@@ -111,8 +114,8 @@ contract FastPriceFeed {
     event SetPyth(IPyth _pyth);
     event SetMaxPriceTsDiff(uint256 _maxPriceTsDiff);
 
-    modifier onlyRouter() {
-        require(IManager(manager).checkRouter(msg.sender), "FastPriceFeed: forbidden");
+    modifier onlyExecutorRouter() {
+        require(IManager(manager).checkExecutorRouter(msg.sender), "FastPriceFeed: forbidden");
         _;
     }
 
@@ -127,6 +130,7 @@ contract FastPriceFeed {
     }
 
     constructor(
+        address _WETH,
         address _manager,
         uint256 _priceDuration,
         uint256 _indexPriceDuration,
@@ -137,7 +141,8 @@ contract FastPriceFeed {
     ) {
         require(_priceDuration <= MAX_PRICE_DURATION, "FastPriceFeed: invalid _priceDuration");
         require(_indexPriceDuration <= MAX_PRICE_DURATION, "FastPriceFeed: invalid _indexPriceDuration");
-        require(_manager != address(0), "FastPriceFeed: invalid manager");
+        require(_manager != address(0) && _WETH != address(0), "FastPriceFeed: invalid address");
+        WETH = _WETH;
         manager = _manager;
         priceDuration = _priceDuration;
         maxPriceUpdateDelay = _maxPriceUpdateDelay;
@@ -252,14 +257,17 @@ contract FastPriceFeed {
 
         emit SetTokens(_tokens, _feedIds, _pythFeedIds, _backUpPricePrecisions, _primaryPricePrecisions);
     }
-    
-    function setPrices(bytes memory backupPrices, bytes memory primaryPrices) external payable onlyRouter{
+
+    /// @notice off-chain price update
+    /// @param sender price data sender
+    /// @param priceType price type {0:backup price;1:pyth price;2:data stream price}
+    /// @param offChainPrices off-chain price array
+    function setPrices(address sender, uint8 priceType, bytes memory offChainPrices) external onlyExecutorRouter {
         uint256 price;
         bool shouldUpdate;
-        if (backupPrices.length == 0 && primaryPrices.length == 0) {
-            require(false, "FastPriceFeed: invalid prices length");
-        } else if (backupPrices.length != 0 && primaryPrices.length == 0) {
-            bytes[] memory _backupPrices = abi.decode(backupPrices, (bytes[]));
+        require(priceType == 0 || priceType == 1 || priceType == 2, "FastPriceFeed: invalid prices type");
+        if (priceType == 0) {
+            bytes[] memory _backupPrices = abi.decode(offChainPrices, (bytes[]));
             for (uint256 i = 0; i < _backupPrices.length; i++) {
                 (string memory token, uint192 backUpPrice, uint32 ts) = abi.decode(_backupPrices[i], (string, uint192, uint32));
                 shouldUpdate = _setLastUpdatedValues(token, ts);
@@ -271,50 +279,45 @@ contract FastPriceFeed {
                     }
                 }
             }
-        } else {
-            // price type 1:pyth price feed ; price type 2: chainlink price feed
-            (uint8 priceType, bytes memory _primaryPrices) = abi.decode(primaryPrices, (uint8, bytes));
-            require(priceType == 1 || priceType == 2, "FastPriceFeed: invalid priceType");
-            if (priceType == 1) {
-                (bytes32[] memory _priceIds, bytes[] memory _priceUpdateData) = abi.decode(_primaryPrices, (bytes32[], bytes[]));
-                uint256 fee = pyth.getUpdateFee(_priceUpdateData);
-                require(msg.value == fee, "FastPriceFeed: invalid fee");
-                PythStructs.PriceFeed[] memory _priceFeed = pyth.parsePriceFeedUpdates{value: fee}(_priceUpdateData, _priceIds, uint64(block.timestamp.sub(maxPriceTsDiff)), uint64(block.timestamp));
-                
-                for (uint256 i = 0; i < _priceIds.length; i++) {
-                    string memory token = pythFeedIds[_priceIds[i]];
-                    require(_priceFeed[i].price.price > 0 && _priceFeed[i].price.expo <= 0, "FastPriceFeed: invalid price");
+        } else if (priceType == 1) {
+            (bytes32[] memory _priceIds, bytes[] memory _priceUpdateData) = abi.decode(offChainPrices, (bytes32[], bytes[]));
+            uint256 fee = pyth.getUpdateFee(_priceUpdateData);
+            TransferHelper.safeTransferFrom(WETH, sender, address(this), fee);
+            IWrappedCoin(WETH).withdraw(fee);
+            PythStructs.PriceFeed[] memory _priceFeed = pyth.parsePriceFeedUpdates{value: fee}(_priceUpdateData, _priceIds, uint64(block.timestamp.sub(maxPriceTsDiff)), uint64(block.timestamp));
 
-                    shouldUpdate = _setLastUpdatedValues(token, uint32(_priceFeed[i].price.publishTime));
-                    if (shouldUpdate) {
-                        price = uint256(_priceFeed[i].price.price);
-                        price = price.mul(PRICE_PRECISION).div(10 ** uint32(- _priceFeed[i].price.expo));
-                        _setPrice(token, price, marketPriceFeed);
-                    }
-                }
-            } else {
-                bytes[] memory _signedReports = abi.decode(_primaryPrices, (bytes[]));
-                IFeeManager feeManager = IFeeManager(address(verifier.s_feeManager()));
-                address feeNativeTokenAddress = feeManager.i_nativeAddress();
-                uint256 feeCost;
-                for (uint256 i = 0; i < _signedReports.length; i++) {
-                    (BasicReport memory basicReport, uint256 fee) = _calcVerifyFee(_signedReports[i], feeManager, feeNativeTokenAddress);
-                    feeCost = feeCost.add(fee);
-                    shouldUpdate = _setLastUpdatedValues(feedIds[basicReport.feedId], basicReport.validFromTimestamp);
-                    if (shouldUpdate) {
-                        require(basicReport.price > 0, "FastPriceFeed: invalid price");
-                        price = uint256(basicReport.price);
-                        price = price.mul(PRICE_PRECISION).div(10 ** primaryPricePrecisions[feedIds[basicReport.feedId]]);
-                        _setPrice(feedIds[basicReport.feedId], price, marketPriceFeed);
-                    }
-                }
+            for (uint256 i = 0; i < _priceIds.length; i++) {
+                string memory token = pythFeedIds[_priceIds[i]];
+                require(_priceFeed[i].price.price > 0 && _priceFeed[i].price.expo <= 0, "FastPriceFeed: invalid price");
 
-                // Verify the reports
-                verifier.verifyBulk{value: feeCost}(
-                    _signedReports,
-                    abi.encode(feeNativeTokenAddress)
-                );
+                shouldUpdate = _setLastUpdatedValues(token, uint32(_priceFeed[i].price.publishTime));
+                if (shouldUpdate) {
+                    price = uint256(_priceFeed[i].price.price);
+                    price = price.mul(PRICE_PRECISION).div(10 ** uint32(- _priceFeed[i].price.expo));
+                    _setPrice(token, price, marketPriceFeed);
+                }
             }
+        } else {
+            bytes[] memory _signedReports = abi.decode(offChainPrices, (bytes[]));
+            IFeeManager feeManager = IFeeManager(address(verifier.s_feeManager()));
+            address feeNativeTokenAddress = feeManager.i_nativeAddress();
+            uint256 feeCost;
+            for (uint256 i = 0; i < _signedReports.length; i++) {
+                (BasicReport memory basicReport, uint256 fee) = _calcVerifyFee(_signedReports[i], feeManager, feeNativeTokenAddress);
+                feeCost = feeCost.add(fee);
+                shouldUpdate = _setLastUpdatedValues(feedIds[basicReport.feedId], basicReport.validFromTimestamp);
+                if (shouldUpdate) {
+                    require(basicReport.price > 0, "FastPriceFeed: invalid price");
+                    price = uint256(basicReport.price);
+                    price = price.mul(PRICE_PRECISION).div(10 ** primaryPricePrecisions[feedIds[basicReport.feedId]]);
+                    _setPrice(feedIds[basicReport.feedId], price, marketPriceFeed);
+                }
+            }
+
+            // Verify the reports
+            TransferHelper.safeTransferFrom(WETH, sender, address(this), feeCost);
+            IWrappedCoin(WETH).withdraw(feeCost);
+            verifier.verifyBulk{value: feeCost}(_signedReports, abi.encode(feeNativeTokenAddress));
         }
     }
 

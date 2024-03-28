@@ -121,7 +121,7 @@ contract MarketLogic is IMarketLogic {
         }
         
         (iParams.deltaAmount, iParams.orderValue, iParams.price) = getPrice(iParams.pool ,order.market, order.direction, iParams.deltaAmount, iParams.orderValue, false);
-        require((order.takerOpenPriceMin > 0 ? iParams.price >= order.takerOpenPriceMin : true) || (order.takerOpenPriceMax > 0 ? iParams.price <= order.takerOpenPriceMax : true), "MT2");
+        require((order.takerOpenPriceMin > 0 ? iParams.price >= order.takerOpenPriceMin : true) && (order.takerOpenPriceMax > 0 ? iParams.price <= order.takerOpenPriceMax : true), "MT2");
 
         response.tradeValue = iParams.marketType == 1 ? iParams.deltaAmount : iParams.orderValue;
         order.takerFee = iParams.orderValue.mul(iParams.marketConfig.tradeFeeRate).div(RATE_PRECISION);

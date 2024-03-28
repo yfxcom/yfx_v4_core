@@ -11,7 +11,7 @@ import "../interfaces/IWrappedCoin.sol";
 
 contract Order is IOrder {
     using EnumerableSet for EnumerableSet.UintSet;
-    
+
     address WETH;
     address public manager;
     uint256 public orderId;
@@ -57,15 +57,15 @@ contract Order is IOrder {
         order.orderType = params.orderType;
         order.createTs = createTs;
         if (params.orderType == PoolOrderType.Increase) {
-            require(params.margin > 0, "OCI0");
+            uint256 minAddLiquidityAmount = IPool(params.pool).minAddLiquidityAmount();
+            require(params.margin >= minAddLiquidityAmount && params.margin > 0, "OCI0");
             order.margin = params.margin;
             order.leverage = params.leverage;
             order.isStakeLp = params.isStakeLp;
         } else {
-            require(params.liquidity > 0, "OCI1");
             // check the liquidity of the pool
             IPool.Position memory position = IPool(params.pool).makerPositions(IPool(params.pool).makerPositionIds(params.maker));
-            require(position.liquidity > 0, "OCI2");
+            require(position.liquidity > 0 && params.liquidity > 0, "OCI2");
             order.liquidity = params.liquidity;
             order.isUnStakeLp = params.isUnStakeLp;
         }
@@ -79,10 +79,11 @@ contract Order is IOrder {
     /// @notice Update the status of the order
     /// @param _orderId The id of the order
     /// @param status The address of the pool
-    function updatePoolOrder(uint256 _orderId, PoolOrderStatus status) external override onlyRouter {
+    function updatePoolOrder(uint256 _orderId, PoolOrderStatus status) external override {
+        require(IManager(manager).checkExecutorRouter(msg.sender) || IManager(manager).checkRouter(msg.sender), "OUP");
         require(status != PoolOrderStatus.Submit, "OUP0");
         PoolOrder storage order = poolOrders[_orderId];
-        if(status == PoolOrderStatus.Cancel) require(order.status == PoolOrderStatus.Submit, "OUP1");
+        if (status == PoolOrderStatus.Cancel) require(order.status == PoolOrderStatus.Submit, "OUP1");
         order.status = status;
         address baseAsset = IPool(order.pool).getBaseAsset();
         if (order.orderType == PoolOrderType.Increase) {

@@ -31,8 +31,8 @@ contract RiskFunding {
         _;
     }
 
-    modifier onlyRouter(){
-        require(IManager(manager).checkRouter(msg.sender), "RiskFunding: no permission!");
+    modifier onlyExecutorRouter(){
+        require(IManager(manager).checkExecutorRouter(msg.sender), "RiskFunding: no permission!");
         _;
     }
 
@@ -47,7 +47,7 @@ contract RiskFunding {
         emit SetExecuteLiquidateFee(_fee);
     }
 
-    function updateLiquidatorExecutedFee(address _liquidator) external onlyRouter {
+    function updateLiquidatorExecutedFee(address _liquidator) external onlyExecutorRouter {
         liquidatorExecutedFees[_liquidator] = liquidatorExecutedFees[_liquidator].add(executeLiquidateFee);
         emit UpdateLiquidatorExecutedFee(_liquidator, executeLiquidateFee);
     }

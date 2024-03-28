@@ -15,25 +15,26 @@ contract Manager {
 
     address public controller;      //controller, can change all config params
     address public router;          //router address
+    address public executorRouter;  //executor router address
     address public vault;           //vault address
     address public riskFunding;     //riskFunding address
     address public inviteManager;   //inviteManager address
     address public marketPriceFeed; //marketPriceFeed address
     address public marketLogic;     //marketLogic address
 
-    uint256 public executeOrderFee = 0.0001 ether;  // execution fee of one order
+    uint256 public executeOrderFee = 0.0001 ether;          // execution fee of one order
+    // singer  => type =>isOpen
+    mapping(address => mapping(uint8 => bool)) signers;     // signers are qualified addresses to execute orders and update off-chain price {0:backup price;1:pyth price;2:data stream}
+    mapping(address => mapping(uint8 => bool)) executors;   // liquidators are qualified addresses to liquidate positions {0:market order executor;1:limit order executor;2:liquidity order executor;3:tp,sl,system tp executor}
+    mapping(address => bool) treasurers;                    // vault administrators
 
-    mapping(address => bool) signers;       // signers are qualified addresses to execute orders and update off-chain price
-    mapping(address => bool) treasurers;    // vault administrators
-    mapping(address => bool) liquidators;   // liquidators are qualified addresses to liquidate positions
+    uint256 public communityExecuteOrderDelay;              // time elapse after that every one can execute orders
+    uint256 public cancelElapse;                            // time elapse after that user can cancel not executed orders
+    uint256 public triggerOrderDuration;                    // validity period of trigger orders
 
-    uint256 public communityExecuteOrderDelay;   // time elapse after that every one can execute orders
-    uint256 public cancelElapse;            // time elapse after that user can cancel not executed orders
-    uint256 public triggerOrderDuration;    // validity period of trigger orders
-
-    bool public paused = true;              // protocol pause flag
-    mapping(address => bool) public isFundingPaused;    // funding mechanism pause flag, market => bool
-    mapping(address => bool) public isInterestPaused;   // interests mechanism pause flag, pool => bool
+    bool public paused = true;                              // protocol pause flag
+    mapping(address => bool) public isFundingPaused;        // funding mechanism pause flag, market => bool
+    mapping(address => bool) public isInterestPaused;       // interests mechanism pause flag, pool => bool
 
     mapping(address => address) public getMakerByMarket;        // mapping of market to pool, market => pool
     mapping(address => address) public getMarketMarginAsset;    // mapping of market to base asset, market => base asset
@@ -44,12 +45,12 @@ contract Manager {
     uint256 public orderNumLimit;                               //taker open order number limit
 
     event MarketCreated(address market, address pool, string indexToken, address marginAsset, uint8 marketType);
-    event SignerAdded(address signer);
-    event SignerRemoved(address signer);
+    event SignerModified(address signer, uint8 sType, bool isOpen);
     event Pause(bool paused);
     event Unpause(bool paused);
     event OrderNumLimitModified(uint256 _limit);
     event RouterModified(address _router);
+    event ExecutorRouterModified(address _executorRouter);
     event ControllerModified(address _controller);
     event VaultModified(address _vault);
     event RiskFundingModified(address _riskFunding);
@@ -64,7 +65,7 @@ contract Manager {
     event InterestStatusModified(address pool, bool _interestPaused);
     event FundingStatusModified(address market, bool _fundingPaused);
     event TreasurerModified(address _treasurer, bool _isOpen);
-    event LiquidatorModified(address _liquidator, bool _isOpen);
+    event ExecutorModified(address _liquidator, uint8 eType, bool _isOpen);
     event ControllerInitialized(address _controller);
 
     modifier onlyController{
@@ -92,14 +93,14 @@ contract Manager {
         emit Unpause(paused);
     }
 
-
-    /// @notice modify liquidator
-    /// @param _liquidator liquidator address
-    /// @param _isOpen true open ;false close
-    function modifyLiquidator(address _liquidator, bool _isOpen) external onlyController {
-        require(_liquidator != address(0), "Manager:address error");
-        liquidators[_liquidator] = _isOpen;
-        emit LiquidatorModified(_liquidator, _isOpen);
+    /// @notice modify executor
+    /// @param _executor liquidator address
+    /// @param eType executor type {0:market order executor;1:limit order executor;2:liquidity order executor;3:tp,sl,system tp executor}
+    /// @param isOpen true open ;false close
+    function modifyExecutor(address _executor, uint8 eType, bool isOpen) external onlyController {
+        require(_executor != address(0), "Manager:address error");
+        executors[_executor][eType] = isOpen;
+        emit ExecutorModified(_executor, eType, isOpen);
     }
 
     /// @notice modify treasurer address
@@ -128,25 +129,27 @@ contract Manager {
         emit RouterModified(_router);
     }
 
-    /// @notice add a signer address
-    /// @param _signer signer address
-    function addSigner(address _signer) external onlyController {
-        require(_signer != address(0), "Manager:address zero");
-        signers[_signer] = true;
-        emit SignerAdded(_signer);
+    /// @notice modify executor router address
+    /// @param _executorRouter executor router address
+    function modifyExecutorRouter(address _executorRouter) external onlyController {
+        require(_executorRouter != address(0), "Manager:address zero");
+        executorRouter = _executorRouter;
+        emit ExecutorRouterModified(_executorRouter);
     }
 
-    /// @notice remove a signer address
-    /// @param _signer signer address
-    function removeSigner(address _signer) external onlyController {
-        require(_signer != address(0), "Manager:address zero");
-        signers[_signer] = false;
-        emit SignerRemoved(_signer);
+    /// @notice add a signer address
+    /// @param signer signer address
+    /// @param sType signer type {0:backup price;1:pyth price;2:data stream price}
+    /// @param isOpen true open ;false close
+    function modifySigner(address signer, uint8 sType, bool isOpen) external onlyController {
+        require(signer != address(0), "Manager:address zero");
+        signers[signer][sType] = isOpen;
+        emit SignerModified(signer, sType, isOpen);
     }
 
     /// @notice modify controller address
     /// @param _controller controller address
-    function modifyController(address _controller) external onlyController{
+    function modifyController(address _controller) external onlyController {
         require(_controller != address(0), "Manager:address zero");
         controller = _controller;
         emit ControllerModified(_controller);
@@ -184,7 +187,7 @@ contract Manager {
 
     /// @notice modify vault address
     /// @param _vault vault address
-    function modifyVault(address _vault) external onlyController{
+    function modifyVault(address _vault) external onlyController {
         require(_vault != address(0), "Manager:address zero");
         vault = _vault;
         emit VaultModified(_vault);
@@ -192,28 +195,28 @@ contract Manager {
 
     /// @notice modify price provider fee
     /// @param _fee price provider fee
-    function modifyExecuteOrderFee(uint256 _fee) external onlyController{
+    function modifyExecuteOrderFee(uint256 _fee) external onlyController {
         executeOrderFee = _fee;
         emit ExecuteOrderFeeModified(_fee);
     }
 
     /// @notice modify invite manager address
     /// @param _inviteManager invite manager address
-    function modifyInviteManager(address _inviteManager) external onlyController{
+    function modifyInviteManager(address _inviteManager) external onlyController {
         inviteManager = _inviteManager;
         emit InviteManagerModified(_inviteManager);
     }
 
     /// @notice modify market Price Feed address
     /// @param _marketPriceFeed market Price Feed address
-    function modifyMarketPriceFeed(address _marketPriceFeed) external onlyController{
+    function modifyMarketPriceFeed(address _marketPriceFeed) external onlyController {
         marketPriceFeed = _marketPriceFeed;
         emit MarketPriceFeedModified(_marketPriceFeed);
     }
 
     /// @notice modify market logic address
     /// @param _marketLogic market logic address
-    function modifyMarketLogic(address _marketLogic) external onlyController{
+    function modifyMarketLogic(address _marketLogic) external onlyController {
         marketLogic = _marketLogic;
         emit MarketLogicModified(_marketLogic);
     }
@@ -225,7 +228,6 @@ contract Manager {
         cancelElapse = _cancelElapse;
         emit CancelElapseModified(_cancelElapse);
     }
-
 
     /// @notice modify community execute order delay time
     /// @param _communityExecuteOrderDelay execute time elapse
@@ -244,9 +246,10 @@ contract Manager {
     }
 
     /// @notice validate whether an address is a signer
-    /// @param _signer signer address
-    function checkSigner(address _signer) external view returns (bool) {
-        return signers[_signer];
+    /// @param signer signer address
+    /// @param sType signer type {0:backup price;1:pyth price;2:data stream price}
+    function checkSigner(address signer, uint8 sType) external view returns (bool) {
+        return signers[signer][sType];
     }
 
     /// @notice validate whether an address is a treasurer
@@ -256,9 +259,10 @@ contract Manager {
     }
 
     /// @notice validate whether an address is a liquidator
-    /// @param _liquidator liquidator address
-    function checkLiquidator(address _liquidator) external view returns (bool) {
-        return liquidators[_liquidator];
+    /// @param _executor executor address
+    /// @param _eType executor type {0:market order executor;1:limit order executor;2:liquidity order executor;3:tp,sl,system tp executor}
+    function checkExecutor(address _executor, uint8 _eType) external view returns (bool) {
+        return executors[_executor][_eType];
     }
 
     /// @notice validate whether an address is a controller
@@ -269,6 +273,11 @@ contract Manager {
     /// @notice validate whether an address is the router
     function checkRouter(address _router) external view returns (bool) {
         return _router == router;
+    }
+
+    /// @notice validate whether an address is the executor router
+    function checkExecutorRouter(address _executorRouter) external view returns (bool) {
+        return executorRouter == _executorRouter;
     }
 
     /// @notice validate whether an address is a legal market address
@@ -310,14 +319,14 @@ contract Manager {
 
         getMakerByMarket[market] = pool;
         address asset = IPool(pool).getBaseAsset();
-        if(getPoolBaseAsset[pool] == address(0)){
+        if (getPoolBaseAsset[pool] == address(0)) {
             getPoolBaseAsset[pool] = asset;
         }
         require(getPoolBaseAsset[pool] == asset, 'Manager:pool base asset error');
         getMarketMarginAsset[market] = asset;
 
         isFundingPaused[market] = true;
-        
+
         EnumerableSet.add(markets, market);
         if (!EnumerableSet.contains(pools, pool)) {
             EnumerableSet.add(pools, pool);
@@ -328,7 +337,7 @@ contract Manager {
 
         setMarketConfig(market, _config);
         //let cfg =[[0,0],[4000000,50000],[8000000,100000],[10000000,150000],[12000000,200000],[20000000,600000],[100000000,10000000]]
-        
+
         emit MarketCreated(market, pool, token, asset, marketType);
     }
 
@@ -346,11 +355,11 @@ contract Manager {
 
         IMarket(market).setMarketConfig(_config);
     }
-    
+
     /// @notice modify the pause status for creating an order of a market
     /// @param market market address
     /// @param _paused paused or not
-    function modifyMarketCreateOrderPaused(address market, bool _paused) public onlyController{
+    function modifyMarketCreateOrderPaused(address market, bool _paused) public onlyController {
         MarketDataStructure.MarketConfig memory _config = IMarket(market).getMarketConfig();
         _config.createOrderPaused = _paused;
         setMarketConfig(market, _config);
@@ -359,7 +368,7 @@ contract Manager {
     /// @notice modify the status for setting tpsl for an position
     /// @param market market address
     /// @param _paused paused or not
-    function modifyMarketTPSLPricePaused(address market, bool _paused) public onlyController{
+    function modifyMarketTPSLPricePaused(address market, bool _paused) public onlyController {
         MarketDataStructure.MarketConfig memory _config = IMarket(market).getMarketConfig();
         _config.setTPSLPricePaused = _paused;
         setMarketConfig(market, _config);
@@ -382,7 +391,7 @@ contract Manager {
         _config.updateMarginPaused = _paused;
         setMarketConfig(market, _config);
     }
-    
+
     /// @notice get all markets
     function getAllMarkets() external view returns (address[] memory) {
         address[] memory _markets = new address[](EnumerableSet.length(markets));

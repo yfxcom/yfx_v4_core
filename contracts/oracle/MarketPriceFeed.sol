@@ -196,7 +196,7 @@ contract MarketPriceFeed {
 
         AggregatorV2V3Interface priceFeed = AggregatorV2V3Interface(priceFeedAddress);
 
-        int256 price = priceFeed.latestAnswer();
+        (,int256 price,,,) = priceFeed.latestRoundData();
         require(price > 0, "MarketPriceFeed: invalid price");
 
         return uint256(price).mul(PRICE_PRECISION).div(10 ** priceFeed.decimals());
@@ -208,17 +208,18 @@ contract MarketPriceFeed {
 
         AggregatorV2V3Interface priceFeed = AggregatorV2V3Interface(priceFeedAddress);
         uint256 price = 0;
-        uint256 roundId = priceFeed.latestRound();
+
+        (uint80 roundId,,,,) = priceFeed.latestRoundData();
         for (uint80 i = 0; i < priceSampleSpace; i++) {
             if (roundId <= i) {break;}
             uint256 p;
 
             if (i == 0) {
-                int256 _p = priceFeed.latestAnswer();
+                (,int256 _p,,,) = priceFeed.latestRoundData();
                 require(_p > 0, "MarketPriceFeed: invalid price");
                 p = uint256(_p);
             } else {
-                (, int256 _p, , ,) = priceFeed.getRoundData((roundId - i).toUint80());
+                (, int256 _p, , ,) = priceFeed.getRoundData(roundId - i);
                 require(_p > 0, "MarketPriceFeed: invalid price");
                 p = uint256(_p);
             }

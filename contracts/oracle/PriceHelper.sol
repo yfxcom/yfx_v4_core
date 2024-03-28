@@ -425,14 +425,14 @@ contract PriceHelper is IPriceHelper {
 
         if (slot0.isLong) {
             // premium <  0
-            if (premiumX96 > Constant.FundingRate2_10000X96) {
+            if (premiumX96 > Constant.FundingRate4_10000X96) {
                 fundingRateX96 = Constant.FundingRate5_10000X96 - premiumX96;
             } else {
-                fundingRateX96 = Constant.FundingRate3_10000X96;
+                fundingRateX96 = Constant.FundingRate1_10000X96;
             }
         } else {
-            if (premiumX96 < Constant.FundingRate8_10000X96) {
-                fundingRateX96 = Constant.FundingRate3_10000X96;
+            if (premiumX96 < Constant.FundingRate6_10000X96) {
+                fundingRateX96 = Constant.FundingRate1_10000X96;
             } else {
                 fundingRateX96 = premiumX96 - Constant.FundingRate5_10000X96;
             }
@@ -445,18 +445,18 @@ contract PriceHelper is IPriceHelper {
         if (fundingRateX96 > Constant.FundingRateMaxX96) {
             fundingRateX96 = Constant.FundingRateMaxX96;
         }
-        fundingRateX96 = fundingRateX96 / Constant.FundingRate24Hours;
+        fundingRateX96 = fundingRateX96 / Constant.FundingRate8Hours;
     }
 
     function getConstantValues() public pure returns (int256, int256, int256, int256, int256, int256, int256){
         return (
-            Constant.FundingRate2_10000X96,
-            Constant.FundingRate8_10000X96,
+            Constant.FundingRate4_10000X96,
+            Constant.FundingRate6_10000X96,
             Constant.FundingRate5_10000X96,
-            Constant.FundingRate3_10000X96,
+            Constant.FundingRate1_10000X96,
             Constant.FundingRateMaxX96,
             Constant.FundingRate8Hours,
-            Constant.FundingRate2_10000X96 / Constant.FundingRate8Hours
+            Constant.FundingRate1_10000X96 / Constant.FundingRate8Hours
         );
     }
 }

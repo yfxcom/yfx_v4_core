@@ -30,9 +30,9 @@ library SwapMath {
 
     function calcTradePrice(uint256 indexPrice, uint256 premium1, uint256 premium2, bool slippageAdd) internal pure returns (uint256 tradePrice) {
         if(slippageAdd){
-            tradePrice = indexPrice.mul((Constant.Q96 << 1) + premium1 + premium2).div(Constant.Q96 << 1);
+            tradePrice = indexPrice.mul((Constant.Q96 << 1).add(premium1).add(premium2)).div(Constant.Q96 << 1);
         } else {
-            tradePrice = indexPrice.mul((Constant.Q96 << 1) - premium1 - premium2).div(Constant.Q96 << 1);
+            tradePrice = indexPrice.mul((Constant.Q96 << 1).sub(premium1).sub(premium2)).div(Constant.Q96 << 1);
         }
     }
 
@@ -72,10 +72,10 @@ library SwapMath {
         validateSwapStep(step);
         uint256 premiumX96End;
         if(premiumIncrease){
-            sizeMax = step.upper.size - step.current.size;
+            sizeMax = step.upper.size.sub(step.current.size);
             premiumX96End = step.upper.premiumX96;
         } else {
-            sizeMax = step.current.size - step.lower.size;
+            sizeMax = step.current.size.sub(step.lower.size);
             premiumX96End = step.lower.premiumX96;
         }
         uint256 tradePrice = calcTradePrice(indexPrice, step.current.premiumX96, premiumX96End, slippageAdd);
@@ -146,7 +146,7 @@ library SwapMath {
                 tradeSize = amountSpecified;
                 premiumX96End = calcInMiddlePremiumX96(step, tradeSize, premiumIncrease);
                 endTick.premiumX96 = premiumX96End;
-                endTick.size = premiumIncrease ? step.current.size + tradeSize : step.current.size - tradeSize;
+                endTick.size = premiumIncrease ? step.current.size.add(tradeSize) : step.current.size.sub(tradeSize);
                 uint256 tradePrice = calcTradePrice(indexPrice, step.current.premiumX96, premiumX96End, slippageAdd);
                 tradeVol = sizeToVol(tradePrice, tradeSize, isLinear);
             } else {
@@ -164,16 +164,16 @@ library SwapMath {
             require(step.lower.premiumX96 == step.upper.premiumX96,"tick error =");
             return step.upper.premiumX96;
         }
-        premiumX96Delta = step.upper.premiumX96 - step.lower.premiumX96;
-        sizeDelta = step.upper.size - step.lower.size;
+        premiumX96Delta = step.upper.premiumX96.sub(step.lower.premiumX96);
+        sizeDelta = step.upper.size.sub(step.lower.size);
 
         premiumX96Impact = size.mul(premiumX96Delta); // SafeMath.mul(size, premiumX96Delta);
         premiumX96Impact = premiumX96Impact.div(sizeDelta); // SafeMath.div(premiumX96Impact, sizeDelta);
 
         if(premiumIncrease){
-            return step.current.premiumX96 + premiumX96Impact;
+            return step.current.premiumX96.add(premiumX96Impact);
         } else {
-            return step.current.premiumX96 - premiumX96Impact;
+            return step.current.premiumX96.sub(premiumX96Impact);
         }
     }
 

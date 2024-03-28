@@ -44,7 +44,12 @@ contract Market is MarketStorage, ReentrancyGuard {
     }
 
     modifier onlyRouter() {
-        require(IManager(manager).checkRouter(msg.sender) || (msg.sender == address(this)), "MO2");
+        require(IManager(manager).checkRouter(msg.sender), "MO2");
+        _;
+    }
+
+    modifier onlyExecutor() {
+        require(IManager(manager).checkExecutorRouter(msg.sender), "MOE1");
         _;
     }
 
@@ -108,7 +113,9 @@ contract Market is MarketStorage, ReentrancyGuard {
         emit SwitchPositionMode(_taker, _mode);
     }
 
-    function createOrder(MarketDataStructure.CreateInternalParams memory params) public nonReentrant onlyRouter whenNotCreateOrderPaused returns (uint256) {
+    function createOrder(MarketDataStructure.CreateInternalParams memory params) public whenNotCreateOrderPaused returns (uint256) {
+        require(IManager(manager).checkRouter(msg.sender) || (msg.sender == address(this)) || IManager(manager).checkExecutorRouter(msg.sender), "MO2");
+        
         MarketDataStructure.Order memory order = IMarketLogic(marketLogic).createOrderInternal(params);
         order.id = ++orderID;
 
@@ -140,7 +147,7 @@ contract Market is MarketStorage, ReentrancyGuard {
     /// @param _id order id
     /// @return resultCode execute result 0：open success；1:order open fail；2:trigger order open fail; 3:low-level call failed
     /// @return _positionId position id
-    function executeOrder(uint256 _id) external nonReentrant onlyRouter returns (uint256 resultCode, uint256 _positionId, bool isAllClosed) {
+    function executeOrder(uint256 _id) external nonReentrant onlyExecutor returns (uint256 resultCode, uint256 _positionId, bool isAllClosed) {
         ExecuteOrderInternalParams memory params;
         params.order = orders[_id];
         //freezeMargin > 0 ,order type is open and position direction is same as order direction;freezeMargin = 0,order type is close and position direction is neg of order direction
@@ -288,7 +295,7 @@ contract Market is MarketStorage, ReentrancyGuard {
     ///@param _id position id
     ///@param action liquidate type
     ///@return liquidate order id
-    function liquidate(uint256 _id, MarketDataStructure.OrderType action, uint256 clearPrice) public onlyRouter returns (uint256) {
+    function liquidate(uint256 _id, MarketDataStructure.OrderType action, uint256 clearPrice) public onlyExecutor returns (uint256) {
         LiquidateInternalParams memory params;
         MarketDataStructure.Position storage position = takerPositions[_id];
         require(position.amount > 0, "L0");

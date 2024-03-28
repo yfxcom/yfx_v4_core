@@ -3,5 +3,5 @@ pragma solidity >=0.6.0 <0.8.0;
 pragma abicoder v2;
 
 interface IFastPriceFeed {
-    function setPrices(bytes memory backupPrices, bytes memory primaryPrices) external payable;
+    function setPrices(address sender, uint8 priceType, bytes memory offChainPrices) external;
 }

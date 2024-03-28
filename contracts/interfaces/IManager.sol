@@ -7,11 +7,15 @@ interface IManager {
 
     function riskFunding() external view returns (address);
 
-    function checkSigner(address _signer) external view returns (bool);
+    function checkSuperSigner(address _signer) external view returns (bool);
+
+    function checkSigner(address signer, uint8 sType) external view returns (bool);
 
     function checkController(address _controller) view external returns (bool);
 
     function checkRouter(address _router) external view returns (bool);
+
+    function checkExecutorRouter(address _executorRouter) external view returns (bool);
 
     function checkMarket(address _market) external view returns (bool);
 
@@ -47,7 +51,7 @@ interface IManager {
 
     function checkTreasurer(address _treasurer) external view returns (bool);
 
-    function checkLiquidator(address _liquidator) external view returns (bool);
+    function checkExecutor(address _executor, uint8 eType) external view returns (bool);
     
     function communityExecuteOrderDelay() external view returns (uint256);
 
@@ -56,4 +60,6 @@ interface IManager {
     function modifySingleFundingStatus(address market, bool _fundingPaused) external;
     
     function router() external view returns (address);
+
+    function executorRouter() external view returns (address);
 }
