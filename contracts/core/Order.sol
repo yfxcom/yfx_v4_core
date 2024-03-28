@@ -119,4 +119,6 @@ contract Order is IOrder {
         }
         return ids;
     }
+    
+    receive() payable external {}
 }
