@@ -83,7 +83,7 @@ contract Order is IOrder {
         require(IManager(manager).checkExecutorRouter(msg.sender) || IManager(manager).checkRouter(msg.sender), "OUP");
         require(status != PoolOrderStatus.Submit, "OUP0");
         PoolOrder storage order = poolOrders[_orderId];
-        if (status == PoolOrderStatus.Cancel) require(order.status == PoolOrderStatus.Submit, "OUP1");
+        require(order.status == PoolOrderStatus.Submit, "OUP1");
         order.status = status;
         address baseAsset = IPool(order.pool).getBaseAsset();
         if (order.orderType == PoolOrderType.Increase) {
@@ -92,8 +92,8 @@ contract Order is IOrder {
                 TransferHelper.safeTransfer(baseAsset, IManager(manager).vault(), order.margin);
             } else {
                 // refund margin
-                if (order.isETH) {
-                    IWrappedCoin(WETH).withdraw(order.margin);
+                if (baseAsset == WETH && order.isETH) {
+                    IWrappedCoin(baseAsset).withdraw(order.margin);
                     TransferHelper.safeTransferETH(order.maker, order.margin);
                 } else {
                     TransferHelper.safeTransfer(baseAsset, order.maker, order.margin);

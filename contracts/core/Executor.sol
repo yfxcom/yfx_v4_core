@@ -191,8 +191,8 @@ contract Executor is ReentrancyGuard, Multicall {
             _removeLiquidity(order.id, order.pool, order.maker, order.liquidity, order.isUnStakeLp, order.isETH, false);
 
         // refund or send execute fee
-        IRouter(IManager(manager).router()).executorTransfer(isSuccess ? msg.sender : order.maker, order.executeFee);
         IOrder(poolOrder).updatePoolOrder(order.id, isSuccess ? IOrder.PoolOrderStatus.Success : IOrder.PoolOrderStatus.Fail);
+        IRouter(IManager(manager).router()).executorTransfer(isSuccess ? msg.sender : order.maker, order.executeFee);
     }
 
     /// @notice remove liquidity by system ,tp/sl

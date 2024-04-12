@@ -21,11 +21,10 @@ contract MarketPriceFeed {
     uint256 public constant MAX_SPREAD_BASIS_POINTS = 50;//max spread basis points 0.5%
     uint256 public constant MAX_ADJUSTMENT_INTERVAL = 2 hours;//max adjustment interval 2 hours，is not allowed to be changed in interval
     uint256 public constant MAX_ADJUSTMENT_BASIS_POINTS = 20;//max adjustment basis points 0.2%
-
-    // Identifier of the Sequencer offline flag on the Flags contract
-    address constant private FLAG_ARBITRUM_SEQ_OFFLINE = address(bytes20(bytes32(uint256(keccak256("chainlink.flags.arbitrum-seq-offline")) - 1)));
+    uint256 private constant GRACE_PERIOD_TIME = 3600;
+    
     address public manager;
-    address public chainlinkFlags;//chainlink flags address
+    address public L2sequencer ;//chainlink L2 sequencer 
     address public priceHelper;//priceHelper address
 
     bool public isSecondaryPriceEnabled = true; //is offChain price enabled
@@ -47,7 +46,7 @@ contract MarketPriceFeed {
     mapping(string => bool) public  isAdjustmentAdditive;//token => is adjustment additive
     mapping(string => uint256) public lastAdjustmentTimings;//token => last adjustment timing
 
-    event SetChainlinkFlags(address indexed _chainlinkFlags);
+    event SetChainlinkL2sequencer(address indexed _L2sequencer);
     event SetPriceHelper(address indexed _priceHelper);
     event SetAdjustment(string indexed _token, bool indexed _isAdditive, uint256 indexed _adjustmentBps);
     event SetIsSecondaryPriceEnabled(bool indexed _isEnabled);
@@ -77,10 +76,10 @@ contract MarketPriceFeed {
         _;
     }
 
-    function setChainlinkFlags(address _chainlinkFlags) external onlyController {
-        require(_chainlinkFlags != address(0), "MarketPriceFeed: _chainlinkFlags is zero address");
-        chainlinkFlags = _chainlinkFlags;
-        emit SetChainlinkFlags(_chainlinkFlags);
+    function setChainlinkL2sequencer(address _L2sequencer) external onlyController {
+        require(_L2sequencer != address(0), "MarketPriceFeed: _L2sequencer is zero address");
+        L2sequencer = _L2sequencer;
+        emit SetChainlinkL2sequencer(_L2sequencer);
     }
 
     function setPriceHelper(address _priceHelper) external onlyController {
@@ -194,8 +193,9 @@ contract MarketPriceFeed {
         address priceFeedAddress = priceFeeds[_token];
         require(priceFeedAddress != address(0), "MarketPriceFeed: invalid price feed");
 
+        _checkSequencer();
+        
         AggregatorV2V3Interface priceFeed = AggregatorV2V3Interface(priceFeedAddress);
-
         (,int256 price,,,) = priceFeed.latestRoundData();
         require(price > 0, "MarketPriceFeed: invalid price");
 
@@ -208,6 +208,8 @@ contract MarketPriceFeed {
 
         AggregatorV2V3Interface priceFeed = AggregatorV2V3Interface(priceFeedAddress);
         uint256 price = 0;
+
+        _checkSequencer();
 
         (uint80 roundId,,,,) = priceFeed.latestRoundData();
         for (uint80 i = 0; i < priceSampleSpace; i++) {
@@ -243,6 +245,33 @@ contract MarketPriceFeed {
         // normalise price precision
         uint256 _priceDecimals = priceDecimals[_token];
         return price.mul(PRICE_PRECISION).div(10 ** _priceDecimals);
+    }
+
+    function _checkSequencer() internal view {
+        if (L2sequencer != address(0)) {
+            // prettier-ignore
+            (
+            /*uint80 roundID*/,
+                int256 answer,
+                uint256 startedAt,
+            /*uint256 updatedAt*/,
+            /*uint80 answeredInRound*/
+            ) = AggregatorV2V3Interface(L2sequencer).latestRoundData();
+
+            // Answer == 0: Sequencer is up
+            // Answer == 1: Sequencer is down
+            bool isSequencerUp = answer == 0;
+            if (!isSequencerUp) {
+                revert ("SequencerDown");
+            }
+
+            // Make sure the grace period has passed after the
+            // sequencer is back up.
+            uint256 timeSinceUp = block.timestamp - startedAt;
+            if (timeSinceUp <= GRACE_PERIOD_TIME) {
+                revert ("GracePeriodNotOver");
+            }
+        }
     }
 
     function getSecondaryPrice(string memory _token, uint256 _referencePrice, bool _maximise) public view returns (uint256) {

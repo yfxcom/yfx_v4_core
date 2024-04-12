@@ -259,7 +259,7 @@ contract Router is ReentrancyGuard {
     /// @param _id  position id
     /// @param _profitPrice take-profit price
     /// @param _stopLossPrice stop-loss price
-    function setTPSLPrice(address _market, uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice) external whenNotPaused {
+    function setTPSLPrice(address _market, uint256 _id, uint256 _profitPrice, uint256 _stopLossPrice, bool _isExecutedByIndexPrice) external nonReentrant whenNotPaused {
         MarketDataStructure.Position memory position = IMarket(_market).getPosition(_id);
         require(position.taker == msg.sender && position.amount > 0, "MSTP0");
         IMarket(_market).setTPSLPrice(_id, _profitPrice, _stopLossPrice, _isExecutedByIndexPrice);
@@ -269,7 +269,7 @@ contract Router is ReentrancyGuard {
     /// @notice user modify position mode
     /// @param _market  market contract address
     /// @param _mode  position mode
-    function switchPositionMode(address _market, MarketDataStructure.PositionMode _mode) external {
+    function switchPositionMode(address _market, MarketDataStructure.PositionMode _mode) external nonReentrant {
         IMarketLogic(IMarket(_market).marketLogic()).checkSwitchMode(_market, msg.sender, _mode);
         IMarket(_market).switchPositionMode(msg.sender, _mode);
     }
@@ -283,13 +283,13 @@ contract Router is ReentrancyGuard {
         _params.maker = msg.sender;
         if (_params.orderType == IOrder.PoolOrderType.Increase) {
             address baseAsset = IPool(_params.pool).getBaseAsset();
-            bool isETH = baseAsset == WETH && msg.value > fee;
-            if (isETH) {
+            _params.isETH = baseAsset == WETH && msg.value > fee;
+            if (_params.isETH) {
                 _params.margin = msg.value.sub(fee);
             } else {
                 require(msg.value == fee, "MCRP1");
             }
-            _transfer(baseAsset, poolOrder, _params.margin, isETH);
+            _transfer(baseAsset, poolOrder, _params.margin, _params.isETH);
         } else {
             require(msg.value == fee, "MCRP2");
         }
@@ -307,8 +307,8 @@ contract Router is ReentrancyGuard {
             && order.createTs.add(uint32(IManager(manager).cancelElapse())) <= block.timestamp,
             "MCPO0"
         );
-        TransferHelper.safeTransferETH(order.maker, order.executeFee);
         IOrder(poolOrder).updatePoolOrder(order.id, IOrder.PoolOrderStatus.Cancel);
+        TransferHelper.safeTransferETH(order.maker, order.executeFee);
     }
 
     /// @notice set the take-profit and stop-loss price for a maker position
@@ -316,8 +316,9 @@ contract Router is ReentrancyGuard {
     /// @param _positionId position id
     /// @param _profitPrice take-profit price
     /// @param _stopLossPrice stop-loss price
-    function setMakerTPSLPrice(address _pool, uint256 _positionId, uint256 _profitPrice, uint256 _stopLossPrice) external {
+    function setMakerTPSLPrice(address _pool, uint256 _positionId, uint256 _profitPrice, uint256 _stopLossPrice) external nonReentrant {
         IPool(_pool).setTPSLPrice(msg.sender, _positionId, _profitPrice, _stopLossPrice);
+        require(_profitPrice > _stopLossPrice, "SM0");
         emit SetMakerTPSLPrice(_pool, _positionId, _profitPrice, _stopLossPrice);
     }
 
@@ -335,8 +336,8 @@ contract Router is ReentrancyGuard {
 
     function _transfer(address asset, address to, uint256 amount, bool isETH) internal {
         if (isETH) {
-            IWrappedCoin(WETH).deposit{value: amount}();
-            TransferHelper.safeTransfer(WETH, to, amount);
+            IWrappedCoin(asset).deposit{value: amount}();
+            TransferHelper.safeTransfer(asset, to, amount);
         } else {
             TransferHelper.safeTransferFrom(asset, msg.sender, to, amount);
         }

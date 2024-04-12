@@ -71,16 +71,6 @@ contract FastPriceFeed {
     IPyth public pyth;
     uint256 public maxPriceTsDiff;//max price timestamp diff
 
-    struct BasicReport {
-        bytes32 feedId; // The feed ID the report has data for
-        uint32 validFromTimestamp; // Earliest timestamp for which price is applicable
-        uint32 observationsTimestamp; // Latest timestamp for which price is applicable
-        uint192 nativeFee; // Base cost to validate a transaction using the report, denominated in the chain’s native token (WETH/ETH)
-        uint192 linkFee; // Base cost to validate a transaction using the report, denominated in LINK
-        uint64 expiresAt; // Latest timestamp where the report can be verified on-chain
-        int192 price; // DON consensus median price, carried to 8 decimal places
-    }
-
     struct PremiumReport {
         bytes32 feedId; // The feed ID the report has data for
         uint32 validFromTimestamp; // Earliest timestamp for which price is applicable
@@ -303,7 +293,7 @@ contract FastPriceFeed {
             address feeNativeTokenAddress = feeManager.i_nativeAddress();
             uint256 feeCost;
             for (uint256 i = 0; i < _signedReports.length; i++) {
-                (BasicReport memory basicReport, uint256 fee) = _calcVerifyFee(_signedReports[i], feeManager, feeNativeTokenAddress);
+                (PremiumReport memory basicReport, uint256 fee) = _calcVerifyFee(_signedReports[i], feeManager, feeNativeTokenAddress);
                 feeCost = feeCost.add(fee);
                 shouldUpdate = _setLastUpdatedValues(feedIds[basicReport.feedId], basicReport.validFromTimestamp);
                 if (shouldUpdate) {
@@ -321,11 +311,10 @@ contract FastPriceFeed {
         }
     }
 
-    function _calcVerifyFee(bytes memory unverifiedReport, IFeeManager feeManager, address feeNativeTokenAddress) internal returns (BasicReport memory basicReport, uint256 feeCost){
+    function _calcVerifyFee(bytes memory unverifiedReport, IFeeManager feeManager, address feeNativeTokenAddress) internal returns (PremiumReport memory basicReport, uint256 feeCost){
         (, /* bytes32[3] reportContextData */ bytes memory reportData) = abi.decode(unverifiedReport, (bytes32[3], bytes));
-        basicReport = abi.decode(reportData, (BasicReport));
-        require(block.timestamp <= basicReport.validFromTimestamp.add(maxPriceTsDiff) && block.timestamp <= basicReport.observationsTimestamp, "FastPriceFeed: invalid price ts");
-        require(basicReport.expiresAt >= block.timestamp, "FastPriceFeed: invalid expiresAt");
+        basicReport = abi.decode(reportData, (PremiumReport));
+        require(block.timestamp <= basicReport.validFromTimestamp.add(maxPriceTsDiff) && basicReport.expiresAt >= block.timestamp, "FastPriceFeed: invalid price ts");
 
         // Report verification fees
         (Common.Asset memory fee, ,) = feeManager.getFeeAndReward(

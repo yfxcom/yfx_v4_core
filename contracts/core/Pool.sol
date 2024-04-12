@@ -379,6 +379,8 @@ contract Pool is ERC20, PoolStorage, ReentrancyGuard {
             balance = balance.add(remainAmount);
         }
         balance = balance.sub(vars.outValue.toInt256());
+
+        require(balanceOf[position.maker] >= position.liquidity, "PL3");
         _burn(position.maker, position.liquidity);
 
         emit Liquidate(++eventId, position.maker, positionId, position.initMargin, position.liquidity, position.entryValue, vars.pnl, remainAmount, vars.penalty, g.sharePrice, g.poolTotalTmp);

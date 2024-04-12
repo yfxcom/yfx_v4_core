@@ -182,7 +182,7 @@ contract Market is MarketStorage, ReentrancyGuard {
         // trigger condition validation
         if (params.order.triggerPrice > 0) {
             if ((block.timestamp >= params.order.createTs.add(IManager(manager).triggerOrderDuration())) ||
-                (params.order.triggerDirection == 1 ? indexPrice < params.order.triggerPrice : indexPrice > params.order.triggerPrice)) {
+                (params.order.triggerDirection == 1 ? indexPrice <= params.order.triggerPrice : indexPrice >= params.order.triggerPrice)) {
                 // 2 is the error code for "trigger order open fail"
                 return (2, _positionId, false);
             }
