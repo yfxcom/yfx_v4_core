@@ -28,6 +28,10 @@ contract PeripheryForEarn {
         manager = _manager;
     }
 
+    function getPositionMode(address _market, address _taker) external view returns (MarketDataStructure.PositionMode _mode){
+        return IMarket(_market).positionModes(_taker);
+    }
+
     function getPositionId(address _market, address _taker, int8 _direction) public view returns (uint256) {
         uint256 id = IMarket(_market).getPositionId(_taker, _direction);
         return id;

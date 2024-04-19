@@ -239,18 +239,23 @@ contract Router is ReentrancyGuard {
         require(order.taker == msg.sender && order.createTs.add(IManager(manager).cancelElapse()) <= block.timestamp, "MORC0");
 
         IMarket(_market).cancel(id);
+
+        uint256 toTransferEth;
         if (order.freezeMargin > 0) {
             if (!order.isETH) {
                 TransferHelper.safeTransfer(marginAsset, order.taker, order.freezeMargin);
             } else {
                 IWrappedCoin(marginAsset).withdraw(order.freezeMargin);
-                TransferHelper.safeTransferETH(order.taker, order.freezeMargin);
+                toTransferEth = toTransferEth.add(order.freezeMargin);
             }
         }
 
-        if (order.status == MarketDataStructure.OrderStatus.Open) TransferHelper.safeTransferETH(order.taker, order.executeFee);
+        if (order.status == MarketDataStructure.OrderStatus.Open) toTransferEth = toTransferEth.add(order.executeFee);
 
         EnumerableSet.remove(notExecuteOrderIds[order.taker][_market], id);
+
+        if(toTransferEth > 0) TransferHelper.safeTransferETH(order.taker, toTransferEth);
+        
         emit Cancel(_market, id);
     }
 
