@@ -10,6 +10,7 @@ interface IPriceHelper {
         uint8 liquidationIndex;
         uint256 baseAssetDivisor;
         uint256 multiplier; // different precision from rate divisor
+        uint256 maxLiquidity;
         Tick.Config[7] tickConfigs;
     }
 

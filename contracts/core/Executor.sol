@@ -146,9 +146,9 @@ contract Executor is ReentrancyGuard, Multicall {
         _liquidate(msg.sender, _market, id, MarketDataStructure.OrderType.Liquidate, 0);
     }
 
-    function closeTakerPositionWithClearPrice(address _pool, address _market, uint256 _positionId, uint256 _clearPrice) external {
+    function closeTakerPositionWithClearPrice(address _market, uint256 _positionId, uint256 _clearPrice) external {
         require(IManager(manager).checkSigner(msg.sender, 0), "EC0");
-        require(IPool(_pool).clearAll(), "EC1");
+        require(IPool(IMarket(_market).pool()).clearAll(), "EC1");
 
         _liquidate(msg.sender, _market, _positionId, MarketDataStructure.OrderType.ClearAll, _clearPrice);
 

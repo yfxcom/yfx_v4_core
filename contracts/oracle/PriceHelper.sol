@@ -88,6 +88,7 @@ contract PriceHelper is IPriceHelper {
 
         _config.liquidationIndex = cfg.liquidationIndex;
         slot0.liquidationIndex = cfg.liquidationIndex;
+        _config.maxLiquidity = cfg.maxLiquidity;
         
         uint256 liquidity = _getMarketLiquidity(pool, market);
 
@@ -396,8 +397,11 @@ contract PriceHelper is IPriceHelper {
 
     function _getMarketLiquidity(address pool, address market) internal view returns (uint256 liquidity) {
         (,, liquidity) = IPool(pool).getMarketAmount(market);// baseAssetPrecision ---> AMOUNT_PRECISION
-        liquidity = SwapMath.convertPrecision(liquidity, marketConfig[market].baseAssetDivisor, Constant.SIZE_DIVISOR);
         MarketTickConfig memory cfg = marketConfig[market];
+        if(liquidity > cfg.maxLiquidity) {
+            liquidity = cfg.maxLiquidity;
+        }
+        liquidity = SwapMath.convertPrecision(liquidity, marketConfig[market].baseAssetDivisor, Constant.SIZE_DIVISOR);
         if(cfg.marketType == 2) {
             liquidity = liquidity.mul(Constant.MULTIPLIER_DIVISOR).div(cfg.multiplier);
         }
