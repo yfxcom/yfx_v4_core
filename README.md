@@ -55,3 +55,7 @@ hardhat compile
 | ETH_USD | [ARB](https://arbiscan.io/address/0x912CE59144191C1204E64559FE8253a0e49E6548)| Quanto | [0x41b98BD7e577D61142d64cdb6b94011C636fBaf2](https://arbiscan.io/address/0x41b98BD7e577D61142d64cdb6b94011C636fBaf2) |[0x1e5Ad8D74680122Cc8fc27A85f883Bd6fcBDeF3d](https://arbiscan.io/address/0x1e5Ad8D74680122Cc8fc27A85f883Bd6fcBDeF3d) |
 | BTC_USD | [YFX](https://arbiscan.io/address/0x569deb225441fd18bde18aed53e2ec7eb4e10d93)| Quanto | [0xC57eA5D83598761B6a899649DAD8f7A2A3df49De](https://arbiscan.io/address/0xC57eA5D83598761B6a899649DAD8f7A2A3df49De) |[0x7dfe5D32C7f61C4aAbC40443C7ad13F38EDBb6DA](https://arbiscan.io/address/0x7dfe5D32C7f61C4aAbC40443C7ad13F38EDBb6DA) |
 | ETH_USD | [YFX](https://arbiscan.io/address/0x569deb225441fd18bde18aed53e2ec7eb4e10d93)| Quanto | [0xD7a9479ae09F46DD09E143C424fC002563E9296F](https://arbiscan.io/address/0xD7a9479ae09F46DD09E143C424fC002563E9296F) |[0xdF90d70dA2282202D065E0b48113C0231d5A0c84](https://arbiscan.io/address/0xdF90d70dA2282202D065E0b48113C0231d5A0c84) |
+
+## Earn System of YFX V4.0
+
+The YFX V4.0 earn system has been online since 0:00 AM UTC on May 23rd. The main contract `RewardRouter.sol` is deployed at [0xa1dbe14b978541b24c4e88489b8e463094f88deb](https://arbiscan.io/address/0xa1dbe14b978541b24c4e88489b8e463094f88deb) on Arbitrum One.
